@@ -37,6 +37,22 @@ class Policy(BasePolicy):
         self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        # if model has vlm_autoregress, use it for text generation
+        if hasattr(model, "vlm_autoregress"):
+            # JIT compile the core inference step for performance
+            if hasattr(model, "_vlm_inference_step"):
+                self._vlm_inference_step = nnx_utils.module_jit(model._vlm_inference_step)
+            self._vlm_autoregress = model.vlm_autoregress
+
+    def infer_text(self, obs: dict) -> str:
+        # Make a copy since transformations may modify the inputs in place.
+        inputs = jax.tree.map(lambda x: x, obs)
+        inputs = self._input_transform(inputs)
+        # Make a batch and convert to jax.Array.
+        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+        self._rng, sample_rng = jax.random.split(self._rng)
+        text = self._vlm_autoregress(observation=_model.Observation.from_dict(inputs), rng=sample_rng)
+        return text[0] if isinstance(text, list) else text
 
     @override
     def infer(self, obs: dict) -> dict:  # type: ignore[misc]
@@ -45,7 +61,7 @@ class Policy(BasePolicy):
         inputs = self._input_transform(inputs)
         # Make a batch and convert to jax.Array.
         inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-
+        text = self.infer_text(obs)
         start_time = time.monotonic()
         self._rng, sample_rng = jax.random.split(self._rng)
         outputs = {
@@ -59,7 +75,9 @@ class Policy(BasePolicy):
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
+            "text": text,
         }
+        
         return outputs
 
     @property
