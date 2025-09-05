@@ -2,6 +2,11 @@ import dataclasses
 import enum
 import logging
 import socket
+import sys
+import os
+
+# Add the OpenPI src directory to the path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
 import tyro
 
@@ -18,6 +23,7 @@ class EnvMode(enum.Enum):
     ALOHA_SIM = "aloha_sim"
     DROID = "droid"
     LIBERO = "libero"
+    BASE = "base"
 
 
 @dataclasses.dataclass
@@ -40,7 +46,7 @@ class Args:
     """Arguments for the serve_policy script."""
 
     # Environment to serve the policy for. This is only used when serving default policies.
-    env: EnvMode = EnvMode.ALOHA_SIM
+    env: EnvMode = EnvMode.BASE
 
     # If provided, will be used in case the "prompt" key is not present in the data, or if the model doesn't have a default
     # prompt.

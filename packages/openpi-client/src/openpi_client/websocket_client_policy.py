@@ -39,6 +39,18 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             except ConnectionRefusedError:
                 logging.info("Still waiting for server...")
                 time.sleep(5)
+                
+    def infer_text(self, obs: Dict) -> str:
+        data = self._packer.pack(obs)
+        self._ws.send(data)
+        response = self._ws.recv()
+        if isinstance(response, str):
+            # we're expecting bytes; if the server sends a string, it's an error.
+            raise RuntimeError(f"Error in inference server:\n{response}")
+        response_dict = msgpack_numpy.unpackb(response)
+        if 'generated_text' not in response_dict:
+            raise RuntimeError(f"Expected 'generated_text' in response but got:\n{response_dict}")
+        return response_dict['generated_text']
 
     @override
     def infer(self, obs: Dict) -> Dict:  # noqa: UP006
