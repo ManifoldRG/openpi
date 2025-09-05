@@ -87,7 +87,7 @@ class Observation(Generic[ArrayT]):
     # Image masks, with same keys as images.
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
-    state: at.Float[ArrayT, "*b s"]
+    state: at.Float[ArrayT, "*b s"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -114,7 +114,7 @@ class Observation(Generic[ArrayT]):
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
-            state=data["state"],
+            state=data.get("state"), # made optional for piqa
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -149,7 +149,8 @@ def preprocess_observation(
     if not set(image_keys).issubset(observation.images):
         raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
-    batch_shape = observation.state.shape[:-1]
+    # adapted model might not have state input, use prompt shape instaed. Assumes prompt has the shape (batch, token length)
+    batch_shape = observation.tokenized_prompt.shape[:-1]
 
     out_images = {}
     for key in image_keys:

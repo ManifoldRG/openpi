@@ -7,6 +7,14 @@ import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
 from typing_extensions import override
+# add path src.v1.modules.openpi.src to sys.path
+import sys
+import os
+
+# Add the openpi source directory to sys.path
+openpi_src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../'))
+if openpi_src_path not in sys.path:
+    sys.path.insert(0, openpi_src_path)
 
 from openpi.models import model as _model
 import openpi.models.gemma as _gemma
@@ -269,13 +277,13 @@ class Pi0(_model.BaseModel):
     
     @at.typecheck
     def vlm_autoregress(
-            self,
-            rng: at.KeyArrayLike,
-            observation: _model.Observation,
-            *,
-            temperature: float = 0.5,
-            top_k: int | None = None,
-            eos_token: int = 1,  # PaliGemma EOS token
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        *,
+        temperature: float = 0.5,
+        top_k: int | None = None,
+        eos_token: int = 1,  # PaliGemma EOS token
     ) -> list[str]:
         """Autoregressively generate text using only the prefix (vision + language) part of the model.
         
@@ -298,9 +306,9 @@ class Pi0(_model.BaseModel):
             List of decoded text strings, one per batch element
         """
         observation = _model.preprocess_observation(None, observation, train=False)
-        batch_size = observation.state.shape[0]
-        
-        # Get initial prefix embeddings 
+        batch_size = observation.tokenized_prompt.shape[0]
+
+        # Get initial prefix embeddings
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         
         # Calculate max_new_tokens from available padding spots in tokenized_prompt_mask
