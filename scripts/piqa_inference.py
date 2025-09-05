@@ -38,19 +38,11 @@ from src.v1.modules.openpi.scripts.serve_policy import create_policy
 from src.v1.modules.openpi.src.openpi.shared import download
 from src.v1.modules.openpi.src.openpi.policies import policy as _policy
 from src.v1.modules.openpi.src.openpi.policies import policy_config as _policy_config
-from src.v1.modules.openpi.src.openpi.serving import websocket_policy_server
 from src.v1.modules.openpi.src.openpi.training import config as _config
 
-# Import websocket client for model inference
-# try:
-#     from openpi_client import websocket_client_policy as _websocket_client_policy
-#     WEBSOCKET_CLIENT_AVAILABLE = True
-# except ImportError as e:
-#     print(f"Warning: websocket client not available: {e}")
-#     WEBSOCKET_CLIENT_AVAILABLE = False
 
 # Restrict tf to CPU
-tf.config.set_visible_devices([], "GPU")
+#tf.config.set_visible_devices([], "GPU")
 
 
 @dataclass
@@ -93,27 +85,22 @@ class DatasetResults:
 
 
 class PIQAInference:
-    """PIQA inference class for model evaluation using websocket client"""
+    """PIQA inference class for model evaluation"""
     
     def __init__(self):
         pass
 
 
     def evaluate_model(self, model: pi0.Pi0, dataloader) -> dict:
-        """Evaluate the model on PIQA dataset using websocket client
-        
+        """Evaluate the model on PIQA dataset
+
         Args:
             model: The pi0 model to evaluate
             dataloader: Data loader for PIQA dataset
 
         Returns:
             Dictionary containing evaluation results
-        """
-        # if not WEBSOCKET_CLIENT_AVAILABLE:
-        #     print("Warning: Websocket client not available, running analysis mode instead")
-        #     # Fall back to dataset analysis
-        #     return self.analyze_dataset_from_loader(dataloader)
-            
+        """  
         counter = 0
         dataset_results = DatasetResults()
 
@@ -124,64 +111,47 @@ class PIQAInference:
             actual_batch_size = len(batch['goal'])  # PIQA dataloader returns goal, sol1, sol2, etc.
             
             # Format PIQA prompts for each sample in the batch
-            text_prompts = batch['question']
-            labels = batch['label']
-            predictions = []
-            
-            # 
-            for i in range(actual_batch_size):
+            predictions = np.zeros((actual_batch_size,), dtype=int) - 1  # Initialize with -1 (invalid)
 
+            # Batch processing
+            # For each sample, prepare element for client inference
+            try:
+                element = {
+                    "prompt": batch['question'], 
+                }
+
+
+                observation = self.prepare_observation(element)
+                # Query pi0 model 
+                response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation)
                 
-                # For each sample, prepare element for client inference
-                try:
-                    element = {
-                        "prompt": text_prompts[i], 
-                    }
+                # Extract binary choice from generated text
+                # For now, use a simple extraction since we don't have label/correct_solution here
+                predictions = self.process_batch_text_response(response)
 
-                    
-                    #element = jax.tree.map(lambda x: x, element)
-                    element = PiqaInputs()(element)
-                    # tokenize the prompt
-                    element = TokenizePrompt(_tokenizer.PaligemmaTokenizer(200))(element) # increase max length for piqa
-                    # Make a batch and convert to jax.Array.
-                    element = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], element)
-                    # Use the Observation from the pi0 module to ensure type compatibility
-                    observation = pi0._model.Observation.from_dict(element)
-                    # Query pi0 model using websocket client
-                    response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation)
-
-                    # Process the response to extract A/B choice
-                    generated_text = str(response)
-                    
-                    # Extract binary choice from generated text
-                    # For now, use a simple extraction since we don't have label/correct_solution here
-                    prediction = self.process_single_text_response(generated_text, labels[i], batch['correct_solution'][i])
-                    predictions.append(generated_text)
-                    
-                except Exception as e:
-                    print(f"Error during inference for sample {i}: {e}")
-                    # Fallback to random prediction
-                    predictions.append(-1) # -1 indicates invalid prediction
+            except Exception as e:
+                print(f"Error during inference for batch {counter}: {e}")
+                # throw exception to avoid silent failures
+                raise e
             
             print(f"Batch {counter} processed {actual_batch_size} samples")
-            print(f"Sample prompt: {text_prompts[0][:200]}...")  # Show first 200 chars of first prompt
+            print(f"Sample prompt: {batch['question'][:5]}...")
             
             counter += 1
 
             # Get ground truth labels from batch
-            gt_labels = np.array(labels)
-            processed_responses = np.array(predictions)
+            gt_labels = np.array(batch['label'])
             
             print(f'Ground truth labels: {gt_labels}')
-            print(f'Predicted labels: {processed_responses}')
-            
+            print(f'Predicted labels: {predictions}')
+
             # Calculate metrics
-            emr = get_exact_match_rate(processed_responses, gt_labels)
+            emr = get_exact_match_rate(predictions, gt_labels)
             action_space = [0, 1]  # Binary classification
             
             # Calculate metrics counts
             total_tp, total_fp, total_fn, valid_fp, invalid_fp = calculate_tp_fp_fn_counts(
-                processed_responses, gt_labels, action_space
+                predictions, gt_labels, action_space
             )
 
             # Calculate all metrics
@@ -192,11 +162,11 @@ class PIQAInference:
             print(f"Micro Precision: {micro_precision}, Micro Recall: {micro_recall}, Micro F1: {micro_f1}")
             
             # Store results for this batch
-            dataset_results.all_preds.extend(processed_responses.tolist() if hasattr(processed_responses, 'tolist') else processed_responses)
+            dataset_results.all_preds.extend(predictions.tolist() if hasattr(predictions, 'tolist') else predictions)
             dataset_results.all_gt.extend(gt_labels.tolist())
             dataset_results.total_invalid_predictions += int(invalid_fp)
             dataset_results.total_batches = counter
-            dataset_results.total_timesteps += len(processed_responses)
+            dataset_results.total_timesteps += len(predictions)
             dataset_results.total_emr += emr
             dataset_results.total_micro_precision += micro_precision
             dataset_results.total_micro_recall += micro_recall
@@ -206,9 +176,6 @@ class PIQAInference:
             gc.collect()
             print(f"Processed {counter} batches, cleared memory")
 
-            # Uncomment to stop after a few batches for testing
-            if counter == 2:
-                break
 
         end_time = time.perf_counter()
         eval_duration = end_time - start_time
@@ -221,61 +188,45 @@ class PIQAInference:
 
         return dataset_results.to_dict()
 
-
-    def process_single_text_response(self, generated_text: str, label: int, correct_solution_text: str) -> int:
-        """Process a single generated text response to extract binary choice
+    def prepare_observation(self, element: dict, max_token_len:int=300) -> dict:
+        """Prepare observation dictionary for model inference
         
         Args:
-            generated_text: Generated text response from the model
-            label: Ground truth label (0 or 1)
-            correct_solution_text: The correct solution text for comparison
+            element: Dictionary containing input data (e.g., prompt)
+            max_token_len: Maximum token length for prompt tokenization
 
         Returns:
-            Binary prediction (0 or 1, -1 for invalid)
+            Prepared observation dictionary
         """
-        # If the generated text matches the correct solution text, return the label
-        if correct_solution_text.strip().lower() in generated_text.strip().lower():
-            return label
-        # else if the generated text is a only numeric 0 or 1, return that
-        elif generated_text.strip() == '0':
-            return 0
-        elif generated_text.strip() == '1':
-            return 1
-        else:
-            # If ambiguous, return invalid prediction
-            return -1
+        #element = jax.tree.map(lambda x: x, element)
+        element = PiqaInputs()(element)
+        # tokenize the prompt
+        element = TokenizePrompt(_tokenizer.PaligemmaTokenizer(max_token_len))(element)
+        # convert to jax.Array.
+        element = jax.tree.map(lambda x: jnp.asarray(x)[...], element)
+        # Use the Observation from the pi0 module to ensure type compatibility
+        observation = pi0._model.Observation.from_dict(element)
+        return observation
 
+    def process_batch_text_response(self, generated_texts: list[str]) -> int:
+        """Process a batch of generated texts response to extract binary choice
+        
+        Args:
+            generated_texts: Generated text responses from the model
 
-    def analyze_dataset_from_loader(self, dataloader) -> dict:
-        """Analyze dataset when model inference is not available"""
-        print("Running dataset analysis mode...")
-        results = {
-            "mode": "analysis_only",
-            "total_samples": 0,
-            "sample_examples": []
-        }
-        
-        counter = 0
-        for batch in dataloader:
-            batch_size = len(batch['goal'])
-            results["total_samples"] += batch_size
-            
-            # Store a few examples
-            if counter < 5:  # Store first 5 batches as examples
-                for i in range(min(batch_size, 3)):  # Up to 3 samples per batch
-                    example = {
-                        "goal": batch['goal'][i],
-                        "solution_1": batch['sol1'][i],
-                        "solution_2": batch['sol2'][i],
-                        "correct_answer": batch['correct_solution'][i]
-                    }
-                    results["sample_examples"].append(example)
-            
-            counter += 1
-            if counter == 10:  # Limit analysis to first 10 batches
-                break
-        
-        return results
+        Returns:
+            Binary predictions (0 or 1, -1 for invalid)
+        """
+        # compare with labels to determine correctness. Generated text should either be 0 or 1, and must match the label
+        def safe_int(x):
+            try:
+                return int(x)
+            except ValueError:
+                return -1
+        vec_safe_int = np.vectorize(safe_int)
+        # Convert generated texts to integers safely
+        generated_texts = vec_safe_int(generated_texts)
+        return generated_texts
 
 
 def parse_args() -> argparse.Namespace:
@@ -303,8 +254,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--batch_size',
         type=int,
-        default=1,
-        help='Batch size for inference (default: 1)'
+        default=16,
+        help='Batch size for inference (default: 32)'
     )
     
     parser.add_argument(
@@ -313,29 +264,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help='Maximum number of samples to process (default: all samples)'
     )
-    
-    parser.add_argument(
-        '--mode',
-        type=str,
-        choices=['analyze', 'inference'],
-        default='inference',
-        help='Mode: analyze dataset structure or run model inference (default: inference)'
-    )
-    
-    # Websocket client arguments for inference mode
-    parser.add_argument(
-        '--host',
-        type=str,
-        default='0.0.0.0',
-        help='Host address for the model server (default: 0.0.0.0)'
-    )
-    
-    parser.add_argument(
-        '--port',
-        type=int,
-        default=8000,
-        help='Port for the model server (default: 8000)'
-    )
+     
     
     args = parser.parse_args()
     
@@ -355,100 +284,47 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"Results will be stored in: {args.output_dir}")
     print(f"Reading PIQA dataset from: {args.dataset_dir}")
-    
-    if args.mode == 'analyze':
-        # Initialize analyzer for dataset analysis
-        analyzer = PIQAInference()
+
+    config = pi0.Pi0Config(action_horizon=1)
+    model = config.load(_model.restore_params(download.maybe_download("s3://openpi-assets/checkpoints/pi0_base/params")))
+
+    print('Model loaded')
+    try:
+        piqa_inference = PIQAInference()
         
-        try:
-            # Use PIQA dataloader for analysis
-            dataset_obj, dataloader = get_piqa_test_dataloader(
-                test_dir=args.dataset_dir,
-                batch_size=args.batch_size
-            )
+        # Create PIQA dataloader using the piqa_dataloader module
+        dataset_obj, dataloader = get_piqa_test_dataloader(
+            test_dir=args.dataset_dir, 
+            batch_size=args.batch_size
+        )
+        
+        print(f"Created dataloader with {len(dataset_obj)} samples")
+        
+        # Run inference
+        results = piqa_inference.evaluate_model(
+            model, dataloader
+        )
+        
+        results_file = os.path.join(args.output_dir, 'piqa_inference_results.json')
+        
+        # Save results
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=4)
             
-            # Run analysis using dataloader
-            results = analyzer.analyze_dataset_from_loader(dataloader)
-            
-            # Print results to console
-            print("\n=== PIQA Dataset Analysis Results ===")
-            print(f"Mode: {results.get('mode', 'analysis')}")
-            print(f"Total samples: {results.get('total_samples', 0)}")
-            
-            if 'sample_examples' in results:
-                print(f"\nSample examples ({len(results['sample_examples'])}):")
-                for i, example in enumerate(results['sample_examples'][:5]):
-                    print(f"\n  Example {i+1}:")
-                    print(f"    Goal: {example['goal']}")
-                    print(f"    Solution 1: {example['solution_1']}")
-                    print(f"    Solution 2: {example['solution_2']}")
-                    print(f"    Correct Answer: {example['correct_answer']}")
-            
-            # Save results to JSON file
-            results_file = os.path.join(args.output_dir, 'piqa_analysis_results.json')
-            with open(results_file, 'w') as f:
-                json.dump(results, f, indent=4)
-            
-            print(f"\nDetailed results saved to: {results_file}")
-            
-        except Exception as e:
-            print(f"Error during analysis: {e}")
-            return 1
-    
-    elif args.mode == 'inference':
-        # Initialize websocket client for model evaluation
-        # if not WEBSOCKET_CLIENT_AVAILABLE:
-        #     print("Error: websocket client is required for inference mode")
-        #     return 1
-        config = pi0.Pi0Config(action_horizon=1)
-        #key = jax.random.key(0)
-        model = config.load(_model.restore_params(download.maybe_download("s3://openpi-assets/checkpoints/pi0_base/params")))
-        # from src.v1.modules.openpi.scripts.serve_policy import Args
-        # policy_args = Args()
-        # policy = create_policy(policy_args)
-        print('Model loaded')
-        try:
-            # Create websocket client to connect to model server
-            # client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
-            # print(f'Connected to model server at {args.host}:{args.port}')
-            piqa_inference = PIQAInference()
-            
-            # Get dataset stats (for PIQA, this is minimal since it's text-only)
-            dataset_stats = {}  # Not needed for websocket client
-            
-            # Create PIQA dataloader using the piqa_dataloader module
-            dataset_obj, dataloader = get_piqa_test_dataloader(
-                test_dir=args.dataset_dir, 
-                batch_size=args.batch_size
-            )
-            
-            print(f"Created dataloader with {len(dataset_obj)} samples")
-            
-            # Run inference
-            results = piqa_inference.evaluate_model(
-                model, dataloader
-            )
-            
-            results_file = os.path.join(args.output_dir, 'piqa_inference_results.json')
-            
-            # Save results
-            with open(results_file, 'w') as f:
-                json.dump(results, f, indent=4)
-                
-            print(f"Inference results saved to: {results_file}")
-            
-            # Print summary
-            print(f"\n=== PIQA Inference Results Summary ===")
-            print(f"Total timesteps: {results.get('total_timesteps', 0)}")
-            print(f"Average EMR: {results.get('avg_emr', 0):.3f}")
-            print(f"Average Micro F1: {results.get('avg_micro_f1', 0):.3f}")
-            print(f"Average Micro Precision: {results.get('avg_micro_precision', 0):.3f}")
-            print(f"Average Micro Recall: {results.get('avg_micro_recall', 0):.3f}")
-            print(f"Evaluation time: {results.get('eval_time', 0):.2f} seconds")
-            
-        except Exception as e:
-            print(f"Error during inference: {e}")
-            return 1
+        print(f"Inference results saved to: {results_file}")
+        
+        # Print summary
+        print(f"\n=== PIQA Inference Results Summary ===")
+        print(f"Total timesteps: {results.get('total_timesteps', 0)}")
+        print(f"Average EMR: {results.get('avg_emr', 0):.3f}")
+        print(f"Average Micro F1: {results.get('avg_micro_f1', 0):.3f}")
+        print(f"Average Micro Precision: {results.get('avg_micro_precision', 0):.3f}")
+        print(f"Average Micro Recall: {results.get('avg_micro_recall', 0):.3f}")
+        print(f"Evaluation time: {results.get('eval_time', 0):.2f} seconds")
+        
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        return 1
     
     return 0
 

@@ -1,6 +1,7 @@
 import dataclasses
 
 import einops
+import jax
 import numpy as np
 
 from openpi import transforms
@@ -32,7 +33,8 @@ class PiqaInputs(transforms.DataTransformFn):
         # stored in "prompt"; the output dict always needs to have the key "prompt").
         
         # Create inputs dict. 
-        dummy_image = _parse_image(np.zeros((224, 224, 3), dtype=np.uint8))
+        batch_size = data['prompt'].shape[0] if isinstance(data['prompt'], np.ndarray) else len(data['prompt'])
+        dummy_image = _parse_image(np.zeros((batch_size, 224, 224, 3), dtype=np.uint8))
         inputs = {
             "prompt": data.get("prompt", ""),
             "image": {
@@ -43,9 +45,9 @@ class PiqaInputs(transforms.DataTransformFn):
             },
             "image_mask": {
                 # Mask any non-existent images with False (if ``mask_padding`` is True).
-                "base_0_rgb": np.False_ if mask_padding else np.True_,
-                "left_wrist_0_rgb": np.False_ if mask_padding else np.True_,
-                "right_wrist_0_rgb": np.False_ if mask_padding else np.True_,
+                "base_0_rgb": jax.numpy.zeros(dummy_image.shape[0], dtype=bool) if mask_padding else jax.numpy.ones(dummy_image.shape[0], dtype=bool),
+                "left_wrist_0_rgb": jax.numpy.zeros(dummy_image.shape[0], dtype=bool) if mask_padding else jax.numpy.ones(dummy_image.shape[0], dtype=bool),
+                "right_wrist_0_rgb": jax.numpy.zeros(dummy_image.shape[0], dtype=bool) if mask_padding else jax.numpy.ones(dummy_image.shape[0], dtype=bool),
             },
         }
 

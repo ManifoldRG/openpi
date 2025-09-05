@@ -245,10 +245,19 @@ class TokenizePrompt(DataTransformFn):
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
 
-        if not isinstance(prompt, str):
-            prompt = prompt.item()
-
-        tokens, token_masks = self.tokenizer.tokenize(prompt)
+        if isinstance(prompt, list):
+            # set as shape (batch_size, max_length) [0]*len(prompt)
+            tokens = [0]*len(prompt)
+            token_masks = [False]*len(prompt)
+            for i in range(len(prompt)):
+                tokens[i], token_masks[i] = self.tokenizer.tokenize(prompt[i])
+                tokens[i] = jax.numpy.array(tokens[i])
+                token_masks[i] = jax.numpy.array(token_masks[i])
+        else:
+            tokens, token_masks = self.tokenizer.tokenize(prompt)
+        # turn into ndarray of shape (batch_size, max_length)
+        tokens = jax.numpy.array(tokens, dtype=jax.numpy.int32)
+        token_masks = jax.numpy.array(token_masks, dtype=jax.numpy.bool_)
         return {**data, "tokenized_prompt": tokens, "tokenized_prompt_mask": token_masks}
 
 
