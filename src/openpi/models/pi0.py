@@ -287,13 +287,9 @@ class Pi0(_model.BaseModel):
     ) -> list[str]:
         """Autoregressively generate text using only the prefix (vision + language) part of the model.
         
-        This implementation uses fixed-size arrays to be compatible with JAX scan. The prefix components
-        (prefix_tokens, prefix_mask, prefix_ar_mask) have fixed dimensions because tokenized_prompt is
-        padded to a fixed shape of (batch_size, 48) regardless of actual prompt length.
-        
-        The number of new tokens to generate is determined by counting available padding spots in 
-        tokenized_prompt_mask. Since different batch elements may have different amounts of padding,
-        we use the minimum across the batch to ensure consistent array sizes for JAX scan.
+        This implementation uses KV caching for efficient generation. The initial prefix (images + existing prompt)
+        is processed once to fill the KV cache, then new tokens are generated incrementally by only processing
+        the last token and updating the cache.
         
         Args:
             rng: Random key for sampling
@@ -308,75 +304,106 @@ class Pi0(_model.BaseModel):
         observation = _model.preprocess_observation(None, observation, train=False)
         batch_size = observation.tokenized_prompt.shape[0]
 
-        # Get initial prefix embeddings
-        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
-        
         # Calculate max_new_tokens from available padding spots in tokenized_prompt_mask
-        # Count False values (padding spots) in tokenized_prompt_mask to determine available space
-        available_padding_spots = jnp.sum(~observation.tokenized_prompt_mask, axis=1)  # Count False values per batch
-        # Use minimum across batch for consistent array sizes - different batch elements may have 
-        # different amounts of padding, but JAX scan requires fixed shapes
+        available_padding_spots = jnp.sum(~observation.tokenized_prompt_mask, axis=1)
         max_new_tokens = jnp.min(available_padding_spots)
         
-        # Track which sequences have finished (encountered EOS)
+        # Initialize KV cache with the current prefix (images + existing prompt)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        
+        # Fill KV cache with prefix - get the last hidden states for next token prediction
+        (prefix_outputs, _), kv_cache = self.PaliGemma.llm(
+            [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
+        )
+        
+        # Track generation state
         finished = jnp.zeros(batch_size, dtype=jnp.bool_)
-        
-        # Split random keys for each step
         step_rngs = jax.random.split(rng, max_new_tokens + 1)
-        
-        # Initialize working copies of tokenized_prompt and mask that we'll update
         current_tokenized_prompt = observation.tokenized_prompt
         current_tokenized_prompt_mask = observation.tokenized_prompt_mask
+        current_seq_len = jnp.sum(prefix_mask, axis=1)  # Current sequence length per batch
 
         def step_fn(carry, step_idx):
-            tokenized_prompt, prompt_mask, finished_status = carry
+            tokenized_prompt, prompt_mask, finished_status, seq_len, cache, current_outputs = carry
             step_rng = step_rngs[step_idx]
             
-            # Create updated observation with current tokenized_prompt state
-            updated_observation = observation.replace(
-                tokenized_prompt=tokenized_prompt,
-                tokenized_prompt_mask=prompt_mask
-            )
+            # Get logits from the last position in the current sequence
+            # current_outputs contains the hidden states from the most recent forward pass
+            last_position_idx = seq_len - 1  # 0-indexed position of last token
             
-            # Use the JIT-compiled inference step for performance
-            next_token = self._vlm_inference_step(
-                observation=updated_observation,
-                rng=step_rng,
-                temperature=temperature,
-                top_k=top_k
-            )
+            # Extract the hidden state at the last position for each batch element
+            batch_indices = jnp.arange(batch_size)
+            last_hidden_states = current_outputs[batch_indices, last_position_idx]  # Shape: (batch, hidden_dim)
+            
+            # Get logits for next token
+            logits = self.PaliGemma.llm(last_hidden_states[:, None, :], method="decode")  # Add seq dim
+            logits = logits[:, 0, :]  # Remove seq dim: (batch, vocab_size)
+            
+            # Apply temperature and sampling
+            if temperature == 0.0:
+                next_token = jnp.argmax(logits, axis=-1)
+            else:
+                if temperature != 1.0:
+                    logits = logits / temperature
+                
+                if top_k is not None:
+                    top_k_logits, top_k_indices = jax.lax.top_k(logits, k=top_k)
+                    top_k_mask = jnp.zeros_like(logits, dtype=jnp.bool_)
+                    top_k_mask = top_k_mask.at[batch_indices[:, None], top_k_indices].set(True)
+                    logits = jnp.where(top_k_mask, logits, -jnp.inf)
+                
+                next_token = jax.random.categorical(step_rng, logits, axis=-1)
             
             # If sequence already finished, keep generating EOS
             next_token = jnp.where(finished_status, eos_token, next_token)
             
-            # Find the next padding spot (first False) in each batch element's mask
-            # For JAX compatibility, we need to handle this carefully
-            padding_positions = jnp.argmax(~prompt_mask, axis=1)  # Find first False position
-            
-            # Update tokenized_prompt by placing next_token in the padding position
-            batch_indices = jnp.arange(batch_size)
+            # Update the tokenized prompt and mask
+            padding_positions = jnp.argmax(~prompt_mask, axis=1)
             new_tokenized_prompt = tokenized_prompt.at[batch_indices, padding_positions].set(next_token)
-            
-            # Update prompt_mask by setting the padding position to True
             new_prompt_mask = prompt_mask.at[batch_indices, padding_positions].set(True)
             
             # Update finished status
             new_finished = finished_status | (next_token == eos_token)
             
-            return (new_tokenized_prompt, new_prompt_mask, new_finished), next_token
+            # For the next iteration, we need to process the new token and update cache
+            # Embed the new token
+            new_token_embeddings = self.PaliGemma.llm(next_token[:, None], method="embed")  # (batch, 1, embed_dim)
+            
+            # Create attention mask for the new token (can attend to all previous tokens)
+            new_attn_mask = jnp.ones((batch_size, 1, seq_len[0] + 1), dtype=jnp.bool_)
+            new_positions = seq_len[:, None]  # Position of the new token
+            
+            # Process new token and update cache - this gives us the updated hidden states
+            (_, new_outputs), new_cache = self.PaliGemma.llm(
+                [None, new_token_embeddings], 
+                mask=new_attn_mask, 
+                positions=new_positions,
+                kv_cache=cache
+            )
+            
+            # Update sequence length
+            new_seq_len = seq_len + 1
+            
+            # Concatenate the new token's hidden state to the existing outputs
+            # current_outputs has shape (batch, seq_len, hidden_dim)
+            # new_outputs has shape (batch, 1, hidden_dim) 
+            updated_outputs = jnp.concatenate([current_outputs, new_outputs], axis=1)
+            
+            return (new_tokenized_prompt, new_prompt_mask, new_finished, new_seq_len, new_cache, updated_outputs), next_token
         
-        # Run autoregressive generation loop for available padding spots
-        init_carry = (current_tokenized_prompt, current_tokenized_prompt_mask, finished)
-        (new_tokenized_prompt, new_prompt_mask, new_finished), generated_token_sequence = jax.lax.scan(
+        # Run autoregressive generation loop
+        init_carry = (current_tokenized_prompt, current_tokenized_prompt_mask, finished, current_seq_len, kv_cache, prefix_outputs)
+        (new_tokenized_prompt, new_prompt_mask, new_finished, final_seq_len, final_cache, final_outputs), generated_token_sequence = jax.lax.scan(
             step_fn, init_carry, jnp.arange(max_new_tokens)
         )
-        # sanity check, decode the new tokenized prompt
-        # Get the tokenized prompt (removing padding by using the mask)
-        batch_idx = 0  # Choose which batch element
+        
+        # Sanity check: decode the new tokenized prompt
+        batch_idx = 0
         mask = new_prompt_mask[batch_idx]
         valid_tokens = new_tokenized_prompt[batch_idx][mask]
-        # Decode back to text
-        decoded_text = self.decode_tokens(valid_tokens[None, :])  # Add batch dimension
+        decoded_text = self.decode_tokens(valid_tokens[None, :])
         logger.info(f"Decoded generated prompt: {decoded_text[0]}")
         
         # Transpose to get shape (batch, max_new_tokens)
