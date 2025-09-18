@@ -116,19 +116,12 @@ class PIQAInference:
             # Batch processing
             # For each sample, prepare element for client inference
             try:
-                # Prepare observations for each sample in the batch
-                observations = []
-                for i in range(actual_batch_size):
-                    element = {
-                        "prompt": batch['question'][i],
-                    }
-                    # Prepare a single observation
-                    single_observation = self.prepare_observation(element)
-                    observations.append(single_observation)
-                
-                # Stack observations into a single batch
-                # This uses tree_map to handle the nested dictionary structure of observations
-                observation_batch = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *observations)
+                # Prepare the entire batch at once instead of individual samples
+                element = {
+                    "prompt": batch['question'],  # Pass the entire batch of questions
+                }
+                # Prepare the batch observation
+                observation_batch = self.prepare_observation(element)
 
                 # Query pi0 model with the batch
                 response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation_batch)
@@ -209,6 +202,12 @@ class PIQAInference:
         # Ensure prompt is a list for consistent processing
         if isinstance(element['prompt'], str):
             element['prompt'] = [element['prompt']]
+        # If it's already a list but not numpy array, keep as is
+        elif isinstance(element['prompt'], list):
+            pass
+        else:
+            # Convert other types to list
+            element['prompt'] = list(element['prompt'])
 
         #element = jax.tree.map(lambda x: x, element)
         element = PiqaInputs()(element)
