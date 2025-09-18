@@ -116,14 +116,22 @@ class PIQAInference:
             # Batch processing
             # For each sample, prepare element for client inference
             try:
-                element = {
-                    "prompt": batch['question'], 
-                }
+                # Prepare observations for each sample in the batch
+                observations = []
+                for i in range(actual_batch_size):
+                    element = {
+                        "prompt": batch['question'][i],
+                    }
+                    # Prepare a single observation
+                    single_observation = self.prepare_observation(element)
+                    observations.append(single_observation)
+                
+                # Stack observations into a single batch
+                # This uses tree_map to handle the nested dictionary structure of observations
+                observation_batch = jax.tree.map(lambda *xs: jnp.stack(xs, axis=0), *observations)
 
-
-                observation = self.prepare_observation(element)
-                # Query pi0 model 
-                response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation)
+                # Query pi0 model with the batch
+                response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation_batch)
                 
                 # Extract binary choice from generated text
                 # For now, use a simple extraction since we don't have label/correct_solution here
@@ -198,6 +206,10 @@ class PIQAInference:
         Returns:
             Prepared observation dictionary
         """
+        # Ensure prompt is a list for consistent processing
+        if isinstance(element['prompt'], str):
+            element['prompt'] = [element['prompt']]
+
         #element = jax.tree.map(lambda x: x, element)
         element = PiqaInputs()(element)
         # tokenize the prompt
