@@ -314,9 +314,10 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         
         # Fill KV cache with prefix - get the last hidden states for next token prediction
-        (prefix_outputs, _), kv_cache = self.PaliGemma.llm(
+        (prefix_outputs_list, _), kv_cache = self.PaliGemma.llm(
             [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
         )
+        prefix_outputs = prefix_outputs_list[0]
         
         # Track generation state
         finished = jnp.zeros(batch_size, dtype=jnp.bool_)
@@ -324,21 +325,17 @@ class Pi0(_model.BaseModel):
         current_tokenized_prompt = observation.tokenized_prompt
         current_tokenized_prompt_mask = observation.tokenized_prompt_mask
         current_seq_len = jnp.sum(prefix_mask, axis=1)  # Current sequence length per batch
+        
+        # Get the last hidden state from the prefix to start generation
+        batch_indices = jnp.arange(batch_size)
+        last_hidden_states = prefix_outputs[batch_indices, current_seq_len - 1]
 
         def step_fn(carry, step_idx):
-            tokenized_prompt, prompt_mask, finished_status, seq_len, cache, current_outputs = carry
+            tokenized_prompt, prompt_mask, finished_status, seq_len, cache, last_hidden = carry
             step_rng = step_rngs[step_idx]
             
-            # Get logits from the last position in the current sequence
-            # current_outputs contains the hidden states from the most recent forward pass
-            last_position_idx = seq_len - 1  # 0-indexed position of last token
-            
-            # Extract the hidden state at the last position for each batch element
-            batch_indices = jnp.arange(batch_size)
-            last_hidden_states = current_outputs[batch_indices, last_position_idx]  # Shape: (batch, hidden_dim)
-            
-            # Get logits for next token
-            logits = self.PaliGemma.llm(last_hidden_states[:, None, :], method="decode")  # Add seq dim
+            # Get logits for next token from the last hidden state
+            logits = self.PaliGemma.llm(last_hidden[:, None, :], method="decode")  # Add seq dim
             logits = logits[:, 0, :]  # Remove seq dim: (batch, vocab_size)
             
             # Apply temperature and sampling
@@ -371,31 +368,29 @@ class Pi0(_model.BaseModel):
             # Embed the new token
             new_token_embeddings = self.PaliGemma.llm(next_token[:, None], method="embed")  # (batch, 1, embed_dim)
             
-            # Create attention mask for the new token (can attend to all previous tokens)
+            # The attention mask should be for the new token to attend to all previous tokens
+            # The length of the sequence is now seq_len + 1. The new token is at the end.
+            # The mask for the new token should allow it to see all previous `seq_len` tokens and itself.
             new_attn_mask = jnp.ones((batch_size, 1, seq_len[0] + 1), dtype=jnp.bool_)
             new_positions = seq_len[:, None]  # Position of the new token
             
-            # Process new token and update cache - this gives us the updated hidden states
-            (_, new_outputs), new_cache = self.PaliGemma.llm(
-                [None, new_token_embeddings], 
-                mask=new_attn_mask, 
+            # Process new token and update cache
+            (new_hidden_states_list, _), new_cache = self.PaliGemma.llm(
+                [new_token_embeddings, None],  # Pass to the first expert
+                mask=new_attn_mask,
                 positions=new_positions,
-                kv_cache=cache
+                kv_cache=cache,
             )
             
-            # Update sequence length
+            # Update sequence length and get the new last hidden state
             new_seq_len = seq_len + 1
-            
-            # Concatenate the new token's hidden state to the existing outputs
-            # current_outputs has shape (batch, seq_len, hidden_dim)
-            # new_outputs has shape (batch, 1, hidden_dim) 
-            updated_outputs = jnp.concatenate([current_outputs, new_outputs], axis=1)
-            
-            return (new_tokenized_prompt, new_prompt_mask, new_finished, new_seq_len, new_cache, updated_outputs), next_token
+            new_last_hidden = new_hidden_states_list[0][:, 0, :]  # Shape: (batch, hidden_dim)
+
+            return (new_tokenized_prompt, new_prompt_mask, new_finished, new_seq_len, new_cache, new_last_hidden), next_token
         
         # Run autoregressive generation loop
-        init_carry = (current_tokenized_prompt, current_tokenized_prompt_mask, finished, current_seq_len, kv_cache, prefix_outputs)
-        (new_tokenized_prompt, new_prompt_mask, new_finished, final_seq_len, final_cache, final_outputs), generated_token_sequence = jax.lax.scan(
+        init_carry = (current_tokenized_prompt, current_tokenized_prompt_mask, finished, current_seq_len, kv_cache, last_hidden_states)
+        (new_tokenized_prompt, new_prompt_mask, new_finished, final_seq_len, final_cache, _), generated_token_sequence = jax.lax.scan(
             step_fn, init_carry, jnp.arange(max_new_tokens)
         )
         
