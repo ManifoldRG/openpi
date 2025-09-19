@@ -490,8 +490,15 @@ def test_model_on_all_images(model, processor, name, output_dir):
             for prompt_key, prompt_config in PROMPT_TYPES.items():
                 print(f"  Testing {prompt_config['description']}...")
 
-                # Generate text with this prompt
+                # Generate text with this prompt - use positional args like working example
                 inputs = processor(prompt_config['template'], pil_image, return_tensors="pt")
+                print(f"    Input keys: {list(inputs.keys())}")
+                print(f"    Input IDs shape: {inputs['input_ids'].shape}")
+                print(f"    Pixel values shape: {inputs['pixel_values'].shape}")
+                if 'attention_mask' in inputs:
+                    print(f"    Attention mask shape: {inputs['attention_mask'].shape}")
+                    print(f"    Attention mask sum: {inputs['attention_mask'].sum()}")
+                    print(f"    Input IDs length: {inputs['input_ids'].shape[-1]}")
 
                 with torch.no_grad():
                     output = model.generate(
