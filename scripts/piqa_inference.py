@@ -12,6 +12,8 @@ import numpy as np
 import tensorflow as tf
 import gc
 
+import torch
+
 # Add the project root to the path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../../')))
 # Add the OpenPI src directory to the path
@@ -39,6 +41,8 @@ from src.v1.modules.openpi.src.openpi.shared import download
 from src.v1.modules.openpi.src.openpi.policies import policy as _policy
 from src.v1.modules.openpi.src.openpi.policies import policy_config as _policy_config
 from src.v1.modules.openpi.src.openpi.training import config as _config
+from replace_paligemma_weights_wpi0 import replace_paligemma_weights_with_pi0_weights
+from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 
 
 # Restrict tf to CPU
@@ -91,12 +95,13 @@ class PIQAInference:
         pass
 
 
-    def evaluate_model(self, model: pi0.Pi0, dataloader) -> dict:
+    def evaluate_model(self, processor: AutoProcessor, model: PaliGemmaForConditionalGeneration, dataloader) -> dict:
         """Evaluate the model on PIQA dataset
 
         Args:
-            model: The pi0 model to evaluate
-            dataloader: Data loader for PIQA dataset
+            processor: HuggingFace processor for tokenization
+            model: PaliGemma model with Pi0 weights
+            dataloader: DataLoader for PIQA dataset
 
         Returns:
             Dictionary containing evaluation results
@@ -114,21 +119,16 @@ class PIQAInference:
             predictions = np.zeros((actual_batch_size,), dtype=int) - 1  # Initialize with -1 (invalid)
 
             # Batch processing
-            # For each sample, prepare element for client inference
+            # create a dummy image for each sample in the batch
+            dummy_images = tf.zeros((actual_batch_size, 3, 224, 224), dtype=tf.float32)
             try:
-                # Prepare the entire batch at once instead of individual samples
-                element = {
-                    "prompt": batch['question'],  # Pass the entire batch of questions
-                }
-                # Prepare the batch observation
-                observation_batch = self.prepare_observation(element)
-
-                # Query pi0 model with the batch
-                response = model.vlm_autoregress(rng=jax.random.PRNGKey(0), observation=observation_batch)
-                
-                # Extract binary choice from generated text
-                # For now, use a simple extraction since we don't have label/correct_solution here
-                predictions = self.process_batch_text_response(response)
+                inputs = processor(text=batch, images=dummy_images,
+                  padding="longest", do_convert_rgb=True, return_tensors="pt")
+                inputs = inputs.to(dtype=model.dtype)
+                with torch.no_grad():
+                    output = model.generate(**inputs, max_length=496)
+                generated_texts = [processor.decode(out, skip_special_tokens=True) for out in output]
+                predictions = self.process_batch_text_response(generated_texts)
 
             except Exception as e:
                 print(f"Error during inference for batch {counter}: {e}")
@@ -253,8 +253,14 @@ def parse_args() -> argparse.Namespace:
         default = 'src/v1/processed_datasets/piqa/test/',
         help='Directory containing the PIQA dataset (default: ../../../processed_datasets/piqa/test/)'
     )
-    
-    
+
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda' if torch.cuda.is_available() else 'cpu',
+        help='Device to run the model on (default: cuda if available else cpu)'
+    )
+
     parser.add_argument(
         '--output_dir',
         type=str,
@@ -296,8 +302,7 @@ def main():
     print(f"Results will be stored in: {args.output_dir}")
     print(f"Reading PIQA dataset from: {args.dataset_dir}")
 
-    config = pi0.Pi0Config(action_horizon=1)
-    model = config.load(_model.restore_params(download.maybe_download("s3://openpi-assets/checkpoints/pi0_base/params")))
+    processor, model = replace_paligemma_weights_with_pi0_weights(args.device)
 
     print('Model loaded')
     try:
@@ -313,7 +318,7 @@ def main():
         
         # Run inference
         results = piqa_inference.evaluate_model(
-            model, dataloader
+            processor, model, dataloader
         )
         
         results_file = os.path.join(args.output_dir, 'piqa_inference_results.json')
