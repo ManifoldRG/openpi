@@ -667,13 +667,32 @@ def main():
     processor = AutoProcessor.from_pretrained(model_id)
     print(f"SUCCESS: Loaded processor for {model_id}")
 
-    # Test base model (HuggingFace default)
+    # Test base model (HuggingFace default) - first test just one image to verify it works
     print("\n" + "="*70)
     print("PHASE 1: Testing Base PaliGemma (HuggingFace Default)")
     print("="*70)
 
     model_base = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
-    base_results = test_model_on_all_images(model_base, processor, "Base PaliGemma (HF)", output_dir)
+    
+    # Quick test with base model first
+    print("Quick base model test...")
+    try:
+        test_img = COCO_TEST_IMAGES[0]
+        response = requests.get(test_img['url'], timeout=15)
+        pil_image = Image.open(BytesIO(response.content)).convert("RGB")
+        inputs = processor("caption", pil_image, return_tensors="pt")
+        with torch.no_grad():
+            output = model_base.generate(**inputs, max_new_tokens=10, do_sample=False)
+        input_len = inputs["input_ids"].shape[-1]
+        generated_text = processor.decode(output[0][input_len:], skip_special_tokens=True)
+        print(f"Base model test successful: '{generated_text}'")
+        
+        # If base model works, run full test
+        base_results = test_model_on_all_images(model_base, processor, "Base PaliGemma (HF)", output_dir)
+    except Exception as e:
+        print(f"ERROR: Base model test failed: {e}")
+        print("This suggests the issue is not with Pi0 weight injection")
+        return
 
     # Test Pi0-injected model
     print("\n" + "="*70)
