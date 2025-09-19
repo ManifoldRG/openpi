@@ -156,6 +156,12 @@ class Pi0WeightInjector:
     
     def _handle_shape_mismatch(self, pi0_param, hf_param, param_name):
         """Handle common shape mismatches between Pi0 and HF parameters."""
+        # Handle position embedding shape mismatch (squeeze extra dimension)
+        if ("position_embedding.weight" in param_name and 
+            pi0_param.ndim == 3 and hf_param.ndim == 2 and
+            pi0_param.shape[0] == 1 and pi0_param.shape[1:] == hf_param.shape):
+            return np.squeeze(pi0_param, axis=0)
+        
         # Transpose 2D matrices if needed
         if (pi0_param.ndim == 2 and hf_param.ndim == 2 and 
             pi0_param.shape != hf_param.shape and pi0_param.T.shape == hf_param.shape):
