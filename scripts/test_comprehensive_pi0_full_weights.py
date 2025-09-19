@@ -500,12 +500,30 @@ def test_model_on_all_images(model, processor, name, output_dir):
                     print(f"    Attention mask sum: {inputs['attention_mask'].sum()}")
                     print(f"    Input IDs length: {inputs['input_ids'].shape[-1]}")
 
+                # Ensure all tensors are on the same device as the model
+                device = next(model.parameters()).device
+                inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+                
                 with torch.no_grad():
-                    output = model.generate(
-                        **inputs,
-                        max_new_tokens=prompt_config['max_tokens'],
-                        do_sample=False
-                    )
+                    try:
+                        output = model.generate(
+                            input_ids=inputs['input_ids'],
+                            pixel_values=inputs['pixel_values'],
+                            attention_mask=inputs['attention_mask'],
+                            max_new_tokens=prompt_config['max_tokens'],
+                            do_sample=False,
+                            pad_token_id=processor.tokenizer.eos_token_id,
+                            eos_token_id=processor.tokenizer.eos_token_id
+                        )
+                    except Exception as gen_error:
+                        print(f"    Generation error details: {gen_error}")
+                        # Try with minimal generation parameters
+                        output = model.generate(
+                            input_ids=inputs['input_ids'],
+                            pixel_values=inputs['pixel_values'],
+                            max_new_tokens=5,
+                            do_sample=False
+                        )
 
                 input_len = inputs["input_ids"].shape[-1]
                 generated_text = processor.decode(output[0][input_len:], skip_special_tokens=True)
