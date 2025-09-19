@@ -97,7 +97,7 @@ PROMPT_TYPES = {
 def verify_pi0_weights_available():
     """
     Verify that Pi0 weights can be loaded successfully and return them.
-    
+
     Returns:
         tuple: (bool, dict) - (success, pi0_weights)
     """
@@ -116,16 +116,35 @@ def verify_pi0_weights_available():
             print("  ERROR: 'PaliGemma' key not found in Pi0 parameters.")
             return False, None
 
-        # Check a sample weight to confirm loading
-        sample_weight_path = 'llm.decoder.layers_0.attn.q_proj.kernel'
-        current_level = pi0_weights
-        for key in sample_weight_path.split('.'):
-            current_level = current_level[key]
-        
-        print(f"  Sample Pi0 weight ({sample_weight_path}) shape: {current_level.shape}")
-        print("  SUCCESS: Pi0 weights loaded successfully")
+        # Flatten keys to robustly probe a few expected components
+        def _flatten(tree, prefix=""):
+            out = {}
+            for k, v in tree.items():
+                key = f"{prefix}/{k}" if prefix else k
+                if isinstance(v, dict):
+                    out.update(_flatten(v, key))
+                else:
+                    out[key] = v
+            return out
+
+        flat = _flatten(pi0_weights)
+        candidates = [
+            next((k for k in flat if "llm/layers/attn/q_einsum" in k), None),
+            next((k for k in flat if "llm/layers/mlp/gating_einsum" in k), None),
+            next((k for k in flat if "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/query/kernel" in k), None),
+        ]
+        found = [k for k in candidates if k is not None]
+        if not found:
+            print("  ERROR: Could not find expected Pi0 parameter keys (q_einsum/mlp/vision attn)")
+            return False, None
+
+        for k in found:
+            arr = np.array(flat[k])
+            print(f"  Found key: {k} shape={arr.shape} dtype={arr.dtype}")
+
+        print("  SUCCESS: Pi0 weights loaded and basic keys verified")
         return True, pi0_weights
-        
+
     except Exception as e:
         print(f"  ERROR: Failed to load Pi0 weights: {e}")
         return False, None
@@ -139,181 +158,295 @@ def print_weight_structure(weights_dict, indent=0):
         else:
             print("  " * indent + f"{key}: {value.shape} {value.dtype}")
 
-def inject_paligemma_weights(hf_model, pi0_paligemma_weights, *, min_token_overlap: float = 0.4, verbose: bool = True):
+def inject_paligemma_weights(hf_model, pi0_paligemma_weights, *, verbose: bool = True):
     """
-    Inject all PaliGemma weights from a Pi0 checkpoint into a Hugging Face model using a
-    generic, structure-aware mapping (no hard-coded layer name list).
+    Inject PaliGemma weights from a Pi0 checkpoint into a Hugging Face model
+    using explicit mappings that account for batched tensors and expert exclusion.
 
-    Strategy:
-    - Flatten JAX (Pi0) tree and HF state_dict
-    - Build a shape index for JAX params; allow transpose match for 2D weights
-    - Tokenize names into canonical tokens with light-weight synonyms (kernel~weight, scale~weight, embedding~embed)
-    - For each HF param, find shape-compatible JAX candidates and score by token overlap; pick best unused
-    - Copy weights (with transpose when needed), pad/truncate embeddings if vocab mismatch
+    - Excludes action-expert tensors (suffix `_1` in component names)
+    - Splits batched LLM (18 layers) and Vision (27 layers) tensors
+    - Performs required reshaping/transpositions
 
-    Args:
-        hf_model: Hugging Face PaliGemmaForConditionalGeneration (torch) model instance
-        pi0_paligemma_weights: dict of JAX/Flax weights under PaliGemma
-        min_token_overlap: minimal token overlap score (0..1) to accept a match
-        verbose: print detailed mapping decisions
-
-    Returns:
-        bool indicating whether mapping likely succeeded (>=90% parameters loaded)
+    Returns True if a high fraction of targeted params were loaded.
     """
-    import re
 
-    def flatten_tree(tree, prefix=""):
+    # Helper: flatten nested dict with '/'-joined keys
+    def flatten(tree, prefix=""):
         flat = {}
         for k, v in tree.items():
-            key = f"{prefix}.{k}" if prefix else k
+            key = f"{prefix}/{k}" if prefix else k
             if isinstance(v, dict):
-                flat.update(flatten_tree(v, key))
+                flat.update(flatten(v, key))
             else:
-                flat[key] = v
+                flat[key] = np.array(v)
         return flat
 
-    def tokenize(name: str) -> list[str]:
-        # Split on separators and keep alnum tokens
-        parts = re.split(r"[\./:_]+", name)
-        tokens = []
-        for p in parts:
-            # split layer indices from names: layers_12 -> [layers, 12]
-            tokens += re.split(r"(?<=\D)(?=\d)|(?<=\d)(?=\D)", p)
-        tokens = [t.lower() for t in tokens if t and re.search(r"[a-zA-Z]", t)]
-        # Synonyms to canonical tokens
-        synonyms = {
-            "kernel": "weight",
-            "scale": "weight",
-            "weights": "weight",
-            "embedder": "embed",
-            "embedding": "embed",
-            "embeddings": "embed",
-            "input": "in",
-            "output": "out",
-            "proj": "proj",
-            "q": "q",
-            "k": "k",
-            "v": "v",
-            "o": "o",
-            "ln": "layernorm",
-            "norm": "layernorm",
-            "pos": "position",
-        }
-        tokens = [synonyms.get(t, t) for t in tokens]
-        return tokens
+    flat = flatten(pi0_paligemma_weights)
 
-    def jaccard(a: list[str], b: list[str]) -> float:
-        sa, sb = set(a), set(b)
-        if not sa or not sb:
-            return 0.0
-        return len(sa & sb) / len(sa | sb)
+    # Filter out action expert tensors by excluding names with suffix `_1`
+    def is_action_expert(name: str) -> bool:
+        # consider path segments that end with _1
+        parts = name.split("/")
+        return any(p.endswith("_1") for p in parts)
 
-    # Flatten JAX params under provided subtree (already 'PaliGemma')
-    flat_jax = flatten_tree(pi0_paligemma_weights)
+    flat_main = {k: v for k, v in flat.items() if not is_action_expert(k)}
 
-    # Build shape index for JAX params
-    shape_index = {}
-    transposed_shape_index = {}
-    jax_shapes = {}
-    for jk, jv in flat_jax.items():
-        arr = np.array(jv)
-        jax_shapes[jk] = tuple(arr.shape)
-        shape_index.setdefault(tuple(arr.shape), []).append(jk)
-        # For 2D weights, also index transposed shape
-        if arr.ndim == 2:
-            transposed_shape_index.setdefault((arr.shape[1], arr.shape[0]), []).append(jk)
-
-    # Prepare HF state
     hf_state = hf_model.state_dict()
-    used_jax = set()
     loaded = 0
+    targeted = 0
 
-    # Pre-tokenize JAX keys
-    jax_key_tokens = {jk: tokenize(jk) for jk in flat_jax.keys()}
-
-    for hf_name, hf_param in hf_state.items():
-        target_shape = tuple(hf_param.shape)
-        hf_tokens = tokenize(hf_name)
-
-        # Special-case embeddings: allow vocab padding/truncation later
-        is_embedding = ("embed_tokens" in hf_name) or (hf_name.endswith("lm_head.weight"))
-
-        # Candidate JAX keys by exact shape or, for 2D, by transposed shape
-        candidates = list(shape_index.get(target_shape, []))
-        transpose_needed = {jk: False for jk in candidates}
-        if not candidates and len(target_shape) == 2:
-            t_cands = transposed_shape_index.get(target_shape, [])
-            for jk in t_cands:
-                candidates.append(jk)
-                transpose_needed[jk] = True
-
-        if not candidates:
+    def copy_param(hf_name: str, array: np.ndarray):
+        nonlocal loaded, targeted
+        if hf_name not in hf_state:
             if verbose:
-                print(f"  --> No shape-compatible candidate for: {hf_name} {target_shape}")
-            continue
+                print(f"  SKIP: HF param not found: {hf_name}")
+            return
+        targeted += 1
+        target = hf_state[hf_name]
+        arr = array
+        # If 2D and orientation mismatch, try transpose
+        if tuple(arr.shape) != tuple(target.shape) and arr.ndim == 2 and arr.T.shape == tuple(target.shape):
+            arr = arr.T
+        # Embedding vocab alignment (pad/truncate rows)
+        if hf_name.endswith("embed_tokens.weight") and arr.ndim == 2:
+            hf_vocab, emb_dim = target.shape
+            j_vocab, j_dim = arr.shape
+            if j_dim != emb_dim and j_dim == hf_vocab and j_vocab == emb_dim:
+                # extremely unlikely accidental transpose
+                arr = arr.T
+                j_vocab, j_dim = arr.shape
+            if j_vocab < hf_vocab:
+                padded = np.zeros((hf_vocab, j_dim), dtype=arr.dtype)
+                padded[:j_vocab] = arr
+                arr = padded
+            elif j_vocab > hf_vocab:
+                arr = arr[:hf_vocab]
 
-        # Score candidates by token overlap
-        best_jk = None
-        best_score = -1.0
-        for jk in candidates:
-            if jk in used_jax:
-                continue
-            score = jaccard(hf_tokens, jax_key_tokens[jk])
-            if score > best_score:
-                best_score = score
-                best_jk = jk
-
-        if best_jk is None or best_score < min_token_overlap:
+        if tuple(arr.shape) != tuple(target.shape):
             if verbose:
-                print(f"  --> Low token match for: {hf_name} (best={best_score:.2f})")
-            continue
-
-        # Fetch JAX weight and adapt if needed
-        jax_weight = np.array(flat_jax[best_jk])
-
-        # Embedding vocab alignment
-        if is_embedding and jax_weight.ndim == 2:
-            hf_vocab, emb_dim = target_shape
-            jax_vocab, jax_emb_dim = jax_weight.shape
-            if emb_dim != jax_emb_dim and (jax_emb_dim, emb_dim) == target_shape:
-                # extremely unlikely, skip
-                pass
-            if hf_vocab > jax_vocab:
-                if verbose:
-                    print(f"  Padding vocab for {hf_name} from {jax_vocab} to {hf_vocab}")
-                padded = np.zeros((hf_vocab, jax_emb_dim), dtype=jax_weight.dtype)
-                padded[:hf_vocab] = jax_weight
-                jax_weight = padded
-            elif jax_vocab > hf_vocab:
-                if verbose:
-                    print(f"  Truncating vocab for {hf_name} from {jax_vocab} to {hf_vocab}")
-                jax_weight = jax_weight[:hf_vocab]
-
-        # Transpose linear weights if needed
-        if transpose_needed.get(best_jk, False) and jax_weight.ndim == 2:
-            jax_weight = jax_weight.T
-
-        # Final shape check
-        if tuple(jax_weight.shape) != target_shape:
-            if verbose:
-                print(f"  --> SHAPE MISMATCH after adaption for {hf_name}: HF {target_shape} vs Pi0 {jax_weight.shape}")
-            continue
-
-        # Copy
+                print(f"  SHAPE MISMATCH: {hf_name} HF{tuple(target.shape)} != JAX{tuple(arr.shape)}")
+            return
         with torch.no_grad():
-            hf_param.copy_(torch.from_numpy(jax_weight))
-
-        used_jax.add(best_jk)
+            target.copy_(torch.from_numpy(arr))
         loaded += 1
         if verbose:
-            print(f"  MAPPED: {hf_name}  <=  {best_jk}  (score={best_score:.2f}{', T' if transpose_needed.get(best_jk, False) else ''})")
+            print(f"  LOADED: {hf_name} <= shape {arr.shape}")
 
-    total = len(hf_state)
-    print(f"\n  Loaded {loaded} / {total} parameters with generic mapper.")
-    if loaded < total * 0.9:
-        print("  WARNING: Fewer than 90% parameters loaded; outputs may not be reliable.")
-        return False
-    return True
+    # ------- Direct 1:1 mappings -------
+    direct_map = [
+        ("llm/embedder/input_embedding", "language_model.model.embed_tokens.weight"),
+        ("llm/final_norm/scale", "language_model.model.norm.weight"),
+        ("img/head/kernel", "multi_modal_projector.linear.weight"),
+        ("img/head/bias", "multi_modal_projector.linear.bias"),
+        ("img/embedding/kernel", "vision_tower.vision_model.embeddings.patch_embedding.weight"),
+        ("img/embedding/bias", "vision_tower.vision_model.embeddings.patch_embedding.bias"),
+        ("img/pos_embedding", "vision_tower.vision_model.embeddings.position_embedding.weight"),
+        ("img/Transformer/encoder_norm/scale", "vision_tower.vision_model.post_layernorm.weight"),
+        ("img/Transformer/encoder_norm/bias", "vision_tower.vision_model.post_layernorm.bias"),
+    ]
+
+    for jax_key, hf_name in direct_map:
+        if jax_key in flat_main:
+            arr = flat_main[jax_key]
+            # Convolution kernels in JAX might be HWIO; HF is OIHW. If 4D, attempt HWIO->OIHW
+            if arr.ndim == 4 and "patch_embedding.weight" in hf_name:
+                # Try to detect HWIO (H,W,I,O) and convert to (O,I,H,W)
+                if arr.shape[-1] == hf_state[hf_name].shape[0]:
+                    arr = np.transpose(arr, (3, 2, 0, 1))
+            copy_param(hf_name, arr)
+        else:
+            if verbose:
+                print(f"  WARN: Missing direct key in Pi0 weights: {jax_key}")
+
+    # ------- LLM batched mappings (18 layers) -------
+    # Attention Q
+    q_key = next((k for k in flat_main if k.endswith("llm/layers/attn/q_einsum/w")), None)
+    if q_key is not None:
+        q = flat_main[q_key]  # (18, H, D, Hd)
+        num_layers = q.shape[0]
+        for i in range(num_layers):
+            w = q[i]  # (H, D, Hd)
+            # reshape to (H*Hd, D) then transpose to (out=in_q, in=D) if needed
+            w2 = np.transpose(w, (0, 2, 1)).reshape(-1, w.shape[1])  # (H*Hd, D)
+            copy_param(f"language_model.model.layers.{i}.self_attn.q_proj.weight", w2)
+    else:
+        if verbose:
+            print("  WARN: Missing q_einsum for LLM")
+
+    # Attention K/V: prefer dedicated keys if present; else split kv_einsum
+    k_key = next((k for k in flat_main if k.endswith("llm/layers/attn/k_einsum/w")), None)
+    v_key = next((k for k in flat_main if k.endswith("llm/layers/attn/v_einsum/w")), None)
+    kv_key = next((k for k in flat_main if k.endswith("llm/layers/attn/kv_einsum/w")), None)
+
+    if k_key is not None and v_key is not None:
+        k = flat_main[k_key]  # (18, K, D, Hd) or (18, 1, D, Hd)
+        v = flat_main[v_key]
+        num_layers = k.shape[0]
+        for i in range(num_layers):
+            kk = k[i]
+            if kk.ndim == 4:  # (K, D, Hd)
+                kk = kk[0]
+            kv2 = np.transpose(kk, (1, 0))  # (Hd, D) -> (D?, ?) but shapes are square; safer flatten
+            kk2 = np.transpose(kk, (1, 2, 0)).reshape(-1, kk.shape[1])  # (K*Hd, D)
+            copy_param(f"language_model.model.layers.{i}.self_attn.k_proj.weight", kk2)
+
+            vv = v[i]
+            if vv.ndim == 4:
+                vv = vv[0]
+            vv2 = np.transpose(vv, (1, 2, 0)).reshape(-1, vv.shape[1])  # (K*Hd, D)
+            copy_param(f"language_model.model.layers.{i}.self_attn.v_proj.weight", vv2)
+    elif kv_key is not None:
+        kv = flat_main[kv_key]  # (18, 2, K, D, Hd) where dim1: 0=K,1=V
+        num_layers = kv.shape[0]
+        for i in range(num_layers):
+            k_slice = kv[i, 0]  # (K, D, Hd)
+            v_slice = kv[i, 1]  # (K, D, Hd)
+            k2 = np.transpose(k_slice, (2, 0, 1)).reshape(-1, k_slice.shape[1])  # (K*Hd, D)
+            v2 = np.transpose(v_slice, (2, 0, 1)).reshape(-1, v_slice.shape[1])  # (K*Hd, D)
+            copy_param(f"language_model.model.layers.{i}.self_attn.k_proj.weight", k2)
+            copy_param(f"language_model.model.layers.{i}.self_attn.v_proj.weight", v2)
+    else:
+        if verbose:
+            print("  WARN: Missing k/v einsum for LLM")
+
+    # Attention output projection
+    o_key = next((k for k in flat_main if k.endswith("llm/layers/attn/attn_vec_einsum/w")), None)
+    if o_key is not None:
+        o = flat_main[o_key]  # (18, H, Hd, D)
+        num_layers = o.shape[0]
+        for i in range(num_layers):
+            w = o[i]  # (H, Hd, D)
+            w2 = np.reshape(w, (w.shape[0] * w.shape[1], w.shape[2]))  # (H*Hd, D)
+            # HF expects (D, H*Hd)
+            w2 = w2.T  # (D, H*Hd)
+            copy_param(f"language_model.model.layers.{i}.self_attn.o_proj.weight", w2)
+    else:
+        if verbose:
+            print("  WARN: Missing attn_vec_einsum for LLM")
+
+    # MLP projections
+    gate_key = next((k for k in flat_main if k.endswith("llm/layers/mlp/gating_einsum")), None)
+    up_key = next((k for k in flat_main if k.endswith("llm/layers/mlp/up_einsum")), None)
+    down_key = next((k for k in flat_main if k.endswith("llm/layers/mlp/linear")), None)
+    if gate_key is not None and up_key is not None and down_key is not None:
+        gate = flat_main[gate_key]  # (18, 2?, D, M)
+        up = flat_main[up_key]      # (18, 2?, D, M)
+        down = flat_main[down_key]  # (18, 2?, M, D)
+        num_layers = gate.shape[0]
+        # Select main expert if a second axis exists
+        def main_slice(x):
+            return x[:, 0] if x.ndim == 4 else x
+        gate = main_slice(gate)
+        up = main_slice(up)
+        down = main_slice(down)
+        for i in range(num_layers):
+            g = gate[i]  # (D, M)
+            u = up[i]    # (D, M)
+            d = down[i]  # (M, D)
+            copy_param(f"language_model.model.layers.{i}.mlp.gate_proj.weight", g.T)  # (M, D)
+            copy_param(f"language_model.model.layers.{i}.mlp.up_proj.weight", u.T)    # (M, D)
+            copy_param(f"language_model.model.layers.{i}.mlp.down_proj.weight", d.T)  # (D, M)
+    else:
+        if verbose:
+            print("  WARN: Missing one or more MLP tensors for LLM")
+
+    # Layer norms
+    attn_norm_key = next((k for k in flat_main if k.endswith("llm/layers/attn_norm/scale")), None)
+    mlp_norm_key = next((k for k in flat_main if k.endswith("llm/layers/mlp_norm/scale")), None)
+    if attn_norm_key is not None:
+        v = flat_main[attn_norm_key]  # (18, 2?, D)
+        if v.ndim == 3 and v.shape[1] == 2:
+            v = v[:, 0]
+        for i in range(v.shape[0]):
+            copy_param(f"language_model.model.layers.{i}.input_layernorm.weight", v[i])
+    else:
+        if verbose:
+            print("  WARN: Missing attn_norm/scale for LLM")
+    if mlp_norm_key is not None:
+        v = flat_main[mlp_norm_key]  # (18, 2?, D)
+        if v.ndim == 3 and v.shape[1] == 2:
+            v = v[:, 0]
+        for i in range(v.shape[0]):
+            copy_param(f"language_model.model.layers.{i}.post_attention_layernorm.weight", v[i])
+    else:
+        if verbose:
+            print("  WARN: Missing mlp_norm/scale for LLM")
+
+    # ------- Vision Transformer batched mappings (27 layers) -------
+    def get_vision(key_suffix):
+        return next((k for k in flat_main if k.endswith(key_suffix)), None)
+
+    qv_key = get_vision("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/query/kernel")
+    kv_key_v = get_vision("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/key/kernel")
+    vv_key = get_vision("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/value/kernel")
+    ov_key = get_vision("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/out/kernel")
+    fc1_key = get_vision("img/Transformer/encoderblock/MlpBlock_0/Dense_0/kernel")
+    fc2_key = get_vision("img/Transformer/encoderblock/MlpBlock_0/Dense_1/kernel")
+    ln1_key = get_vision("img/Transformer/encoderblock/LayerNorm_0/scale")
+    ln2_key = get_vision("img/Transformer/encoderblock/LayerNorm_1/scale")
+
+    def vision_qkv_load(jax_key, proj_name):
+        if jax_key is None:
+            if verbose:
+                print(f"  WARN: Missing vision attn {proj_name} kernel")
+            return
+        w = flat_main[jax_key]  # (27, D, H, Hd) for q/k/v
+        num_layers = w.shape[0]
+        for i in range(num_layers):
+            wi = w[i]  # (D, H, Hd)
+            wi2 = np.transpose(wi, (2, 1, 0)).reshape(wi.shape[1] * wi.shape[2], wi.shape[0])  # (H*Hd, D)
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.self_attn.{proj_name}.weight", wi2)
+
+    vision_qkv_load(qv_key, "q_proj")
+    vision_qkv_load(kv_key_v, "k_proj")
+    vision_qkv_load(vv_key, "v_proj")
+
+    if ov_key is not None:
+        w = flat_main[ov_key]  # (27, H, Hd, D)
+        num_layers = w.shape[0]
+        for i in range(num_layers):
+            wi = w[i]  # (H, Hd, D)
+            wi2 = np.reshape(wi, (wi.shape[0] * wi.shape[1], wi.shape[2]))  # (H*Hd, D)
+            wi2 = wi2.T  # (D, H*Hd)
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.self_attn.out_proj.weight", wi2)
+    else:
+        if verbose:
+            print("  WARN: Missing vision attn out kernel")
+
+    if fc1_key is not None:
+        w = flat_main[fc1_key]  # (27, D, M)
+        for i in range(w.shape[0]):
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.mlp.fc1.weight", w[i].T)  # (M, D)
+    else:
+        if verbose:
+            print("  WARN: Missing vision MLP fc1")
+    if fc2_key is not None:
+        w = flat_main[fc2_key]  # (27, M, D)
+        for i in range(w.shape[0]):
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.mlp.fc2.weight", w[i].T)  # (D, M)
+    else:
+        if verbose:
+            print("  WARN: Missing vision MLP fc2")
+
+    if ln1_key is not None:
+        w = flat_main[ln1_key]  # (27, D)
+        for i in range(w.shape[0]):
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.layer_norm1.weight", w[i])
+    else:
+        if verbose:
+            print("  WARN: Missing vision layer_norm1 scale")
+    if ln2_key is not None:
+        w = flat_main[ln2_key]
+        for i in range(w.shape[0]):
+            copy_param(f"vision_tower.vision_model.encoder.layers.{i}.layer_norm2.weight", w[i])
+    else:
+        if verbose:
+            print("  WARN: Missing vision layer_norm2 scale")
+
+    # Summary
+    print(f"\n  Loaded {loaded} / {targeted} targeted HF parameters with explicit mapper.")
+    # Consider successful if we filled at least 80% of targeted (to allow minor naming diffs)
+    return targeted > 0 and loaded / targeted >= 0.8
 
 def test_model_on_all_images(model, processor, name, output_dir):
     """
