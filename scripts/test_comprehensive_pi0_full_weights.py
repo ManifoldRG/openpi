@@ -382,6 +382,140 @@ def inject_paligemma_weights_fixed(hf_model, pi0_paligemma_weights, *, verbose: 
     print(f"    Overall result: {'SUCCESS' if success else 'FAILED'}")
     return success
 
+def inject_and_test_layer_by_layer(model, pi0_weights, processor, output_dir):
+    """
+    Diagnostic function: inject weights layer by layer and test after each injection
+    to identify which parameter group causes the mask/source error.
+    """
+    print("\nDIAGNOSTIC: Layer-by-layer weight injection with testing...")
+    
+    # Flatten weights
+    def flatten(tree, prefix=""):
+        flat = {}
+        for k, v in tree.items():
+            key = f"{prefix}/{k}" if prefix else k
+            if isinstance(v, dict):
+                flat.update(flatten(v, key))
+            else:
+                flat[key] = np.array(v)
+        return flat
+    
+    flat = flatten(pi0_weights)
+    flat_main = {k: v for k, v in flat.items() if not any(p.endswith("_1") for p in k.split("/"))}
+    
+    def test_model_quick():
+        """Quick test to see if model still works"""
+        try:
+            test_img = COCO_TEST_IMAGES[0]
+            response = requests.get(test_img['url'], timeout=15)
+            pil_image = Image.open(BytesIO(response.content)).convert("RGB")
+            inputs = processor("caption", pil_image, return_tensors="pt")
+            with torch.no_grad():
+                output = model.generate(**inputs, max_new_tokens=5, do_sample=False)
+            input_len = inputs["input_ids"].shape[-1]
+            generated_text = processor.decode(output[0][input_len:], skip_special_tokens=True)
+            return True, generated_text
+        except Exception as e:
+            return False, str(e)
+    
+    def inject_single_param(jax_key, hf_name):
+        """Inject a single parameter safely"""
+        if jax_key not in flat_main:
+            return False, f"JAX key {jax_key} not found"
+        
+        state_dict = model.state_dict()
+        if hf_name not in state_dict:
+            return False, f"HF param {hf_name} not found"
+        
+        try:
+            arr = flat_main[jax_key].copy()
+            target = state_dict[hf_name]
+            
+            # Handle basic shape mismatches
+            if arr.ndim == 2 and tuple(arr.shape) != tuple(target.shape):
+                if arr.T.shape == tuple(target.shape):
+                    arr = arr.T
+            
+            # Handle conv transpose
+            if hf_name.endswith("patch_embedding.weight") and arr.ndim == 4:
+                if arr.shape[-1] == target.shape[0]:
+                    arr = np.transpose(arr, (3, 2, 0, 1))
+            
+            # Handle vocab size mismatch for embeddings
+            if hf_name.endswith("embed_tokens.weight") and arr.ndim == 2:
+                hf_vocab, emb_dim = target.shape
+                j_vocab, j_dim = arr.shape
+                if j_vocab != hf_vocab:
+                    if j_vocab < hf_vocab:
+                        padded = np.zeros((hf_vocab, j_dim), dtype=arr.dtype)
+                        padded[:j_vocab] = arr
+                        arr = padded
+                    else:
+                        arr = arr[:hf_vocab]
+            
+            if tuple(arr.shape) != tuple(target.shape):
+                return False, f"Shape mismatch: JAX {arr.shape} vs HF {target.shape}"
+            
+            with torch.no_grad():
+                target.copy_(torch.from_numpy(arr))
+            
+            return True, f"Loaded {hf_name} shape {arr.shape}"
+        
+        except Exception as e:
+            return False, f"Error loading {hf_name}: {e}"
+    
+    # Test baseline
+    print("\n1. Testing baseline model...")
+    success, result = test_model_quick()
+    if not success:
+        print(f"   ERROR: Baseline model failed: {result}")
+        return False, None
+    print(f"   SUCCESS: Baseline works: '{result}'")
+    
+    # Define parameter groups to test incrementally
+    param_groups = [
+        ("Embeddings", [
+            ("llm/embedder/input_embedding", "language_model.model.embed_tokens.weight"),
+        ]),
+        ("Vision Embeddings", [
+            ("img/embedding/kernel", "vision_tower.vision_model.embeddings.patch_embedding.weight"),
+            ("img/embedding/bias", "vision_tower.vision_model.embeddings.patch_embedding.bias"),
+            ("img/pos_embedding", "vision_tower.vision_model.embeddings.position_embedding.weight"),
+        ]),
+        ("Multimodal Projector", [
+            ("img/head/kernel", "multi_modal_projector.linear.weight"),
+            ("img/head/bias", "multi_modal_projector.linear.bias"),
+        ]),
+        ("Final Norms", [
+            ("llm/final_norm/scale", "language_model.model.norm.weight"),
+            ("img/Transformer/encoder_norm/scale", "vision_tower.vision_model.post_layernorm.weight"),
+            ("img/Transformer/encoder_norm/bias", "vision_tower.vision_model.post_layernorm.bias"),
+        ]),
+    ]
+    
+    # Test each group incrementally
+    for group_name, mappings in param_groups:
+        print(f"\n2. Injecting {group_name}...")
+        
+        for jax_key, hf_name in mappings:
+            success_inject, msg = inject_single_param(jax_key, hf_name)
+            print(f"   {msg}")
+            
+            if success_inject:
+                # Test after each parameter injection
+                print(f"   Testing after {hf_name}...")
+                success_test, result = test_model_quick()
+                if not success_test:
+                    print(f"   *** FOUND PROBLEM: {hf_name} causes error: {result}")
+                    print(f"   *** The problematic parameter is: {jax_key} -> {hf_name}")
+                    return False, None
+                else:
+                    print(f"   Still works: '{result[:50]}...'")
+    
+    print(f"\n3. All parameter groups loaded successfully! Running full test...")
+    pi0_results = test_model_on_all_images(model, processor, "Pi0 (Layer-by-layer)", output_dir)
+    return True, pi0_results
+
 def inject_paligemma_weights(hf_model, pi0_paligemma_weights, *, verbose: bool = True):
     """
     Inject PaliGemma weights from a Pi0 checkpoint into a Hugging Face model
@@ -925,31 +1059,10 @@ def main():
 
     model_pi0_hf = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
     
-    # Use fixed full weight injection
-    if inject_paligemma_weights_fixed(model_pi0_hf, pi0_weights):
-        # Quick test after full weight injection
-        print("Quick Pi0 full weights test...")
-        try:
-            test_img = COCO_TEST_IMAGES[0]
-            response = requests.get(test_img['url'], timeout=15)
-            pil_image = Image.open(BytesIO(response.content)).convert("RGB")
-            inputs = processor("caption", pil_image, return_tensors="pt")
-            with torch.no_grad():
-                output = model_pi0_hf.generate(**inputs, max_new_tokens=10, do_sample=False)
-            input_len = inputs["input_ids"].shape[-1]
-            generated_text = processor.decode(output[0][input_len:], skip_special_tokens=True)
-            print(f"Pi0 full weights test successful: '{generated_text}'")
-            
-            # If full weight injection works, run full test
-            pi0_results = test_model_on_all_images(model_pi0_hf, processor, "Pi0 (Full Injection - Fixed)", output_dir)
-        except Exception as e:
-            print(f"ERROR: Pi0 full weights test failed: {e}")
-            print("The full weight injection is causing the mask/source error")
-            import traceback
-            traceback.print_exc()
-            return
-    else:
-        print("ERROR: Failed to inject Pi0 full weights - aborting test")
+    # Use diagnostic layer-by-layer injection to find the problematic parameter
+    success, pi0_results = inject_and_test_layer_by_layer(model_pi0_hf, pi0_weights, processor, output_dir)
+    if not success:
+        print("ERROR: Layer-by-layer diagnostic failed - aborting test")
         return
 
     # Print simple summary instead of HTML report
