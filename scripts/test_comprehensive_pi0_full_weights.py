@@ -78,17 +78,17 @@ COCO_TEST_IMAGES = [
 # Three distinct prompt types for comprehensive evaluation
 PROMPT_TYPES = {
     "basic_caption": {
-        "template": "<image>caption en",
+        "template": "caption",
         "description": "Basic image captioning task",
         "max_tokens": 25
     },
     "detailed_description": {
-        "template": "<image>Provide a detailed description of all objects, people, and activities visible in this image. Include spatial relationships, colors, and any notable details in a comprehensive paragraph.",
+        "template": "Provide a detailed description of all objects, people, and activities visible in this image.",
         "description": "Detailed object and scene description",
         "max_tokens": 75
     },
     "creative_pun": {
-        "template": "<image>Create a clever pun or wordplay based on what you see in this image. Be creative and humorous.",
+        "template": "Create a clever pun or wordplay based on what you see in this image.",
         "description": "Creative text generation requiring wordplay",
         "max_tokens": 40
     }
