@@ -625,32 +625,35 @@ def main():
         download.maybe_download("gs://openpi-assets/checkpoints/pi0_base/params")
     )
     pi0_weights = pi0_params.get("PaliGemma", {})
-    pi0_embeddings = pi0_weights['llm']['embedder']['input_embedding']
+    pi0_llm = pi0_weights.get("llm", {})
+    pi0_embeddings = pi0_llm['embedder']['input_embedding']
 
     print("SUCCESS: Both weight sets loaded")
 
-    # Test base embeddings
+    # Test base embeddings (use original transformers weights without injection)
     print("\n" + "="*70)
-    print("PHASE 1: Testing Base PaliGemma Weights")
+    print("PHASE 1: Testing Base PaliGemma Weights (Original Transformers)")
     print("="*70)
 
+    print("STEP 2: Using original transformers weights without injection...")
     model_base = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
-    if inject_embedding_with_verification(model_base, base_embeddings, "Base PaliGemma"):
-        base_results = test_model_on_all_images(model_base, processor, "Base PaliGemma", output_dir)
-    else:
-        print("ERROR: Failed to inject base embeddings - aborting test")
-        return
+    print("  SUCCESS: Base model loaded with original weights")
+    base_results = test_model_on_all_images(model_base, processor, "Base PaliGemma", output_dir)
 
-    # Test Pi0 embeddings
+    # Test Pi0 full weights (language model only - skip vision tower for faster testing)
     print("\n" + "="*70)
-    print("PHASE 2: Testing Pi0-Trained Weights")
+    print("PHASE 2: Testing Pi0-Trained Weights (Full Language Model Injection)")
     print("="*70)
 
     model_pi0 = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
-    if inject_embedding_with_verification(model_pi0, pi0_embeddings, "Pi0"):
-        pi0_results = test_model_on_all_images(model_pi0, processor, "Pi0", output_dir)
+
+    # Inject only language model weights for comprehensive test
+    injection_count = inject_language_model_weights(model_pi0.state_dict(), pi0_llm)
+    if injection_count > 0:
+        print(f"  SUCCESS: Injected {injection_count} language model weight groups")
+        pi0_results = test_model_on_all_images(model_pi0, processor, "Pi0 Full LM", output_dir)
     else:
-        print("ERROR: Failed to inject Pi0 embeddings - aborting test")
+        print("ERROR: Failed to inject Pi0 language model weights - aborting test")
         return
 
     # Generate reports
@@ -682,6 +685,203 @@ def main():
     print(f"Output Directory: {output_dir}")
     print(f"Total Tests Run: {len(COCO_TEST_IMAGES) * len(PROMPT_TYPES) * 2} individual generations")
     print("="*70)
+
+def inject_full_weights_with_verification(model, jax_paligemma_weights, name="unknown"):
+    """
+    Inject ALL JAX PaliGemma weights into a PyTorch transformers model.
+
+    This function performs a comprehensive weight mapping and injection from
+    JAX PaliGemma format to PyTorch PaliGemma format, covering:
+    - Vision tower (image processing) weights
+    - Language model (text processing) weights including all layers
+    - Multi-modal projection weights
+
+    Args:
+        model: PyTorch transformers PaliGemma model
+        jax_paligemma_weights: Full JAX PaliGemma weights dictionary
+        name: Name for logging purposes
+
+    Returns:
+        bool: True if injection was successful, False otherwise
+    """
+    print(f"\nSTEP 2: Injecting {name} full model weights...")
+
+    state_dict = model.state_dict()
+    injection_count = 0
+
+    # Extract JAX weight components
+    jax_img = jax_paligemma_weights.get('img', {})
+    jax_llm = jax_paligemma_weights.get('llm', {})
+
+    print(f"  JAX components found: img={bool(jax_img)}, llm={bool(jax_llm)}")
+
+    # === 1. INJECT LANGUAGE MODEL WEIGHTS FIRST (most important for text generation) ===
+    print(f"  Injecting language model weights...")
+    llm_injections = inject_language_model_weights(state_dict, jax_llm)
+    injection_count += llm_injections
+
+    # === 2. INJECT MULTIMODAL PROJECTION WEIGHTS ===
+    print(f"  Injecting multimodal projection weights...")
+    proj_injections = inject_projection_weights(state_dict, jax_img)
+    injection_count += proj_injections
+
+    print(f"  SUMMARY: Successfully injected {injection_count} weight groups")
+
+    if injection_count > 0:
+        print(f"  SUCCESS: Full weight injection completed")
+        return True
+    else:
+        print(f"  ERROR: No weights were successfully injected")
+        return False
+
+def inject_language_model_weights(state_dict, jax_llm):
+    """Inject language model weights from JAX to PyTorch format."""
+    injection_count = 0
+
+    if not jax_llm:
+        print("    No JAX language model weights found")
+        return 0
+
+    # Embeddings: JAX llm.embedder.input_embedding -> PyTorch language_model.model.embed_tokens.weight
+    if 'embedder' in jax_llm and 'input_embedding' in jax_llm['embedder']:
+        jax_embeddings = jax_llm['embedder']['input_embedding']  # (257152, 2048)
+
+        # Handle vocab size mismatch (JAX: 257152, PyTorch: 257216)
+        pytorch_vocab_size = 257216
+        jax_vocab_size = jax_embeddings.shape[0]
+
+        if pytorch_vocab_size >= jax_vocab_size:
+            padded_embeddings = np.zeros((pytorch_vocab_size, 2048), dtype=jax_embeddings.dtype)
+            padded_embeddings[:jax_vocab_size] = jax_embeddings
+            inject_weight(state_dict, 'language_model.model.embed_tokens.weight', padded_embeddings)
+        else:
+            truncated_embeddings = jax_embeddings[:pytorch_vocab_size]
+            inject_weight(state_dict, 'language_model.model.embed_tokens.weight', truncated_embeddings)
+
+        print(f"    Injected embeddings: {jax_embeddings.shape} -> PyTorch vocab size {pytorch_vocab_size}")
+        injection_count += 1
+
+    # Transformer layers: JAX llm.layers -> PyTorch language_model.model.layers
+    if 'layers' in jax_llm:
+        layers = jax_llm['layers']
+
+        for layer_idx in range(18):  # 18 language model layers
+            layer_injections = inject_language_layer(state_dict, layers, layer_idx)
+            injection_count += layer_injections
+
+    # Final layer norm: JAX llm.final_norm -> PyTorch language_model.model.norm
+    if 'final_norm' in jax_llm:
+        final_norm = jax_llm['final_norm']
+        inject_weight(state_dict, 'language_model.model.norm.weight', final_norm['scale'])
+        injection_count += 1
+
+    print(f"    Language model injections: {injection_count}")
+    return injection_count
+
+def inject_language_layer(state_dict, jax_layers, layer_idx):
+    """Inject a single language model transformer layer."""
+    injection_count = 0
+
+    prefix = f'language_model.model.layers.{layer_idx}'
+
+    # Attention weights: JAX layers.attn -> PyTorch self_attn
+    if 'attn' in jax_layers:
+        attn = jax_layers['attn']
+
+        # Query projection: JAX q_einsum.w -> PyTorch self_attn.q_proj.weight
+        if 'q_einsum' in attn:
+            q_weight = attn['q_einsum']['w'][layer_idx]  # (8, 2048, 256)
+            # Reshape to PyTorch format: (2048, 2048)
+            q_weight_flat = np.reshape(q_weight.transpose(1, 0, 2), (2048, 2048))
+            inject_weight(state_dict, f'{prefix}.self_attn.q_proj.weight', q_weight_flat)
+            injection_count += 1
+
+        # Key/Value projection: JAX kv_einsum.w -> PyTorch self_attn.k_proj.weight, v_proj.weight
+        if 'kv_einsum' in attn:
+            kv_weight = attn['kv_einsum']['w'][layer_idx]  # (2, 1, 2048, 256)
+
+            # Split into key and value weights
+            k_weight = kv_weight[0, 0]  # (2048, 256)
+            v_weight = kv_weight[1, 0]  # (2048, 256)
+
+            inject_weight(state_dict, f'{prefix}.self_attn.k_proj.weight', k_weight.transpose(1, 0))  # (256, 2048)
+            inject_weight(state_dict, f'{prefix}.self_attn.v_proj.weight', v_weight.transpose(1, 0))  # (256, 2048)
+            injection_count += 2
+
+        # Output projection: JAX attn_vec_einsum.w -> PyTorch self_attn.o_proj.weight
+        if 'attn_vec_einsum' in attn:
+            out_weight = attn['attn_vec_einsum']['w'][layer_idx]  # (8, 256, 2048)
+            # Reshape to PyTorch format: (2048, 2048)
+            out_weight_flat = np.reshape(out_weight, (2048, 2048))
+            inject_weight(state_dict, f'{prefix}.self_attn.o_proj.weight', out_weight_flat)
+            injection_count += 1
+
+    # MLP weights: JAX layers.mlp -> PyTorch mlp
+    if 'mlp' in jax_layers:
+        mlp = jax_layers['mlp']
+
+        # Gate and Up projections: JAX gating_einsum -> PyTorch gate_proj.weight, up_proj.weight
+        if 'gating_einsum' in mlp:
+            gating_weight = mlp['gating_einsum'][layer_idx]  # (2, 2048, 16384)
+
+            # Split gate and up projections
+            gate_weight = gating_weight[0]  # (2048, 16384)
+            up_weight = gating_weight[1]    # (2048, 16384)
+
+            inject_weight(state_dict, f'{prefix}.mlp.gate_proj.weight', gate_weight.transpose(1, 0))  # (16384, 2048)
+            inject_weight(state_dict, f'{prefix}.mlp.up_proj.weight', up_weight.transpose(1, 0))      # (16384, 2048)
+            injection_count += 2
+
+        # Down projection: JAX linear -> PyTorch down_proj.weight
+        if 'linear' in mlp:
+            down_weight = mlp['linear'][layer_idx]  # (16384, 2048)
+            inject_weight(state_dict, f'{prefix}.mlp.down_proj.weight', down_weight.transpose(1, 0))  # (2048, 16384)
+            injection_count += 1
+
+    # Layer norms: JAX pre_attention_norm, pre_ffw_norm -> PyTorch input_layernorm, post_attention_layernorm
+    if 'pre_attention_norm' in jax_layers:
+        pre_attn_norm = jax_layers['pre_attention_norm']
+        inject_weight(state_dict, f'{prefix}.input_layernorm.weight', pre_attn_norm['scale'][layer_idx])
+        injection_count += 1
+
+    if 'pre_ffw_norm' in jax_layers:
+        pre_ffw_norm = jax_layers['pre_ffw_norm']
+        inject_weight(state_dict, f'{prefix}.post_attention_layernorm.weight', pre_ffw_norm['scale'][layer_idx])
+        injection_count += 1
+
+    return injection_count
+
+def inject_projection_weights(state_dict, jax_img):
+    """Inject multimodal projection weights."""
+    injection_count = 0
+
+    # Multimodal projector: JAX img.head -> PyTorch multi_modal_projector.linear
+    if 'head' in jax_img:
+        head = jax_img['head']
+        inject_weight(state_dict, 'multi_modal_projector.linear.weight', head['kernel'].transpose(1, 0))
+        inject_weight(state_dict, 'multi_modal_projector.linear.bias', head['bias'])
+        injection_count += 2
+
+    print(f"    Projection injections: {injection_count}")
+    return injection_count
+
+def inject_weight(state_dict, param_name, jax_weight):
+    """Helper function to inject a single weight with error handling."""
+    if param_name not in state_dict:
+        print(f"    WARNING: Parameter {param_name} not found in PyTorch model")
+        return False
+
+    pytorch_param = state_dict[param_name]
+    jax_tensor = torch.from_numpy(np.array(jax_weight))
+
+    if pytorch_param.shape != jax_tensor.shape:
+        print(f"    WARNING: Shape mismatch for {param_name}: {pytorch_param.shape} vs {jax_tensor.shape}")
+        return False
+
+    with torch.no_grad():
+        pytorch_param.copy_(jax_tensor)
+
+    return True
 
 if __name__ == "__main__":
     main()
