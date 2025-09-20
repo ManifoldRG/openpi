@@ -685,8 +685,9 @@ def test_model_generation(model, processor, model_name):
             
             # Test each prompt
             for prompt, description in PROMPTS:
-                inputs = processor(prompt, image, return_tensors="pt")
-                
+                # need to add '<image>' token to the beginning of prompt
+                inputs = processor(image, f"<image> {prompt}",  return_tensors="pt")
+
                 with torch.no_grad():
                     outputs = model.generate(
                         **inputs, 
