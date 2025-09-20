@@ -56,6 +56,7 @@ class Pi0WeightInjector:
     def __init__(self, pi0_weights):
         self.pi0_weights = self._flatten_weights(pi0_weights)
         self.pi0_main = self._filter_main_weights(self.pi0_weights)
+        self.weight_changes = {}  # Track weight changes during injection
     
     def _flatten_weights(self, weights, prefix=""):
         """Flatten nested weight dictionary with '/' separated keys."""
@@ -439,13 +440,16 @@ class Pi0WeightInjector:
         return loaded
     
     def _copy_param(self, hf_key, pi0_array, hf_state, verbose=False):
-        """Copy Pi0 parameter to HF model state."""
+        """Copy Pi0 parameter to HF model state and track changes."""
         if hf_key not in hf_state:
             if verbose:
                 print(f"    Missing HF key: {hf_key}")
             return False
         
         hf_param = hf_state[hf_key]
+        
+        # Store original weights for comparison
+        original_weights = hf_param.clone().detach().cpu().numpy()
         
         # Handle shape mismatches
         pi0_array = self._handle_shape_mismatch(pi0_array, hf_param, hf_key)
@@ -458,6 +462,21 @@ class Pi0WeightInjector:
         try:
             with torch.no_grad():
                 hf_param.copy_(torch.from_numpy(pi0_array))
+            
+            # Calculate and store weight differences
+            weight_diff = pi0_array - original_weights
+            self.weight_changes[hf_key] = {
+                'original_mean': float(np.mean(original_weights)),
+                'original_std': float(np.std(original_weights)),
+                'new_mean': float(np.mean(pi0_array)),
+                'new_std': float(np.std(pi0_array)),
+                'diff_mean': float(np.mean(weight_diff)),
+                'diff_std': float(np.std(weight_diff)),
+                'diff_magnitude': float(np.linalg.norm(weight_diff)),
+                'relative_change': float(np.linalg.norm(weight_diff) / (np.linalg.norm(original_weights) + 1e-8)),
+                'shape': pi0_array.shape
+            }
+            
             if verbose:
                 print(f"    ✓ Loaded {hf_key}: {pi0_array.shape}")
             return True
@@ -523,6 +542,108 @@ class Pi0WeightInjector:
         print(f"\nModel weights {phase}:")
         for name, param in hf_state.items():
             print(f"  {name}: {param.shape} mean={param.mean().item():.4f}")
+    
+    def analyze_weight_changes(self, verbose=True):
+        """Analyze and display weight change statistics."""
+        if not self.weight_changes:
+            print("No weight changes recorded.")
+            return {}
+        
+        # Calculate overall statistics
+        all_relative_changes = [change['relative_change'] for change in self.weight_changes.values()]
+        all_diff_magnitudes = [change['diff_magnitude'] for change in self.weight_changes.values()]
+        
+        stats = {
+            'total_parameters_changed': len(self.weight_changes),
+            'mean_relative_change': float(np.mean(all_relative_changes)),
+            'std_relative_change': float(np.std(all_relative_changes)),
+            'max_relative_change': float(np.max(all_relative_changes)),
+            'min_relative_change': float(np.min(all_relative_changes)),
+            'mean_diff_magnitude': float(np.mean(all_diff_magnitudes)),
+            'total_diff_magnitude': float(np.sum(all_diff_magnitudes))
+        }
+        
+        if verbose:
+            print(f"\n{'='*60}")
+            print("WEIGHT CHANGE ANALYSIS")
+            print(f"{'='*60}")
+            print(f"Total parameters changed: {stats['total_parameters_changed']}")
+            print(f"Mean relative change: {stats['mean_relative_change']:.6f}")
+            print(f"Std relative change: {stats['std_relative_change']:.6f}")
+            print(f"Max relative change: {stats['max_relative_change']:.6f}")
+            print(f"Min relative change: {stats['min_relative_change']:.6f}")
+            print(f"Mean diff magnitude: {stats['mean_diff_magnitude']:.6f}")
+            print(f"Total diff magnitude: {stats['total_diff_magnitude']:.6f}")
+            
+            # Show top 10 largest changes
+            sorted_changes = sorted(self.weight_changes.items(), 
+                                  key=lambda x: x[1]['relative_change'], reverse=True)
+            
+            print(f"\nTop 10 Largest Relative Changes:")
+            print(f"{'Parameter':<50} {'Rel Change':<12} {'Diff Mag':<12} {'Shape'}")
+            print("-" * 90)
+            for param_name, change in sorted_changes[:10]:
+                short_name = param_name.split('.')[-2:] if '.' in param_name else [param_name]
+                short_name = '.'.join(short_name)
+                print(f"{short_name:<50} {change['relative_change']:<12.6f} "
+                      f"{change['diff_magnitude']:<12.6f} {str(change['shape'])}")
+            
+            # Show parameters with smallest changes (likely unchanged)
+            print(f"\nTop 10 Smallest Relative Changes:")
+            print(f"{'Parameter':<50} {'Rel Change':<12} {'Diff Mag':<12} {'Shape'}")
+            print("-" * 90)
+            for param_name, change in sorted_changes[-10:]:
+                short_name = param_name.split('.')[-2:] if '.' in param_name else [param_name]
+                short_name = '.'.join(short_name)
+                print(f"{short_name:<50} {change['relative_change']:<12.6f} "
+                      f"{change['diff_magnitude']:<12.6f} {str(change['shape'])}")
+        
+        return stats
+    
+    def get_layer_change_summary(self):
+        """Get a summary of changes by layer type."""
+        layer_stats = {}
+        
+        for param_name, change in self.weight_changes.items():
+            # Extract layer type
+            if 'language_model' in param_name:
+                if 'layers.' in param_name:
+                    layer_type = 'llm_layer'
+                else:
+                    layer_type = 'llm_other'
+            elif 'vision_tower' in param_name:
+                if 'layers.' in param_name:
+                    layer_type = 'vision_layer'
+                else:
+                    layer_type = 'vision_other'
+            elif 'multi_modal_projector' in param_name:
+                layer_type = 'projector'
+            else:
+                layer_type = 'other'
+            
+            if layer_type not in layer_stats:
+                layer_stats[layer_type] = {
+                    'count': 0,
+                    'total_relative_change': 0,
+                    'max_relative_change': 0,
+                    'total_diff_magnitude': 0
+                }
+            
+            layer_stats[layer_type]['count'] += 1
+            layer_stats[layer_type]['total_relative_change'] += change['relative_change']
+            layer_stats[layer_type]['max_relative_change'] = max(
+                layer_stats[layer_type]['max_relative_change'], 
+                change['relative_change']
+            )
+            layer_stats[layer_type]['total_diff_magnitude'] += change['diff_magnitude']
+        
+        # Calculate averages
+        for layer_type, stats in layer_stats.items():
+            if stats['count'] > 0:
+                stats['avg_relative_change'] = stats['total_relative_change'] / stats['count']
+                stats['avg_diff_magnitude'] = stats['total_diff_magnitude'] / stats['count']
+        
+        return layer_stats
 
 
 def load_pi0_weights():
@@ -620,6 +741,21 @@ def main():
     injector = Pi0WeightInjector(pi0_weights)
     if injector.inject_weights(pi0_model, verbose=True):
         print("✓ Pi0 weights injected successfully")
+        
+        # Analyze weight changes
+        weight_stats = injector.analyze_weight_changes(verbose=True)
+        layer_summary = injector.get_layer_change_summary()
+        
+        print(f"\n{'='*60}")
+        print("LAYER-WISE CHANGE SUMMARY")
+        print(f"{'='*60}")
+        for layer_type, stats in layer_summary.items():
+            print(f"{layer_type.upper()}:")
+            print(f"  Parameters changed: {stats['count']}")
+            print(f"  Avg relative change: {stats['avg_relative_change']:.6f}")
+            print(f"  Max relative change: {stats['max_relative_change']:.6f}")
+            print(f"  Avg diff magnitude: {stats['avg_diff_magnitude']:.6f}")
+        
         pi0_results = test_model_generation(pi0_model, processor, "Pi0-Injected Model")
     else:
         print("✗ Pi0 weight injection failed")
@@ -630,7 +766,12 @@ def main():
         "timestamp": time.ctime(),
         "model_id": model_id,
         "base_results": base_results,
-        "pi0_results": pi0_results
+        "pi0_results": pi0_results,
+        "weight_analysis": {
+            "overall_stats": weight_stats,
+            "layer_summary": layer_summary,
+            "detailed_changes": injector.weight_changes
+        }
     }
     
     results_file = output_dir / "test_results.json"
