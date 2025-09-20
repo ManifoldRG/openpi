@@ -169,6 +169,13 @@ class Pi0WeightInjector:
             pi0_param.shape[0] == 1 and pi0_param.shape[1:] == hf_param.shape):
             return np.squeeze(pi0_param, axis=0)
         
+        # Handle MLP gate/up projection shape mismatch: (2, D, H) -> (H, D)
+        if (("gate_proj.weight" in param_name or "up_proj.weight" in param_name) and 
+            pi0_param.ndim == 3 and hf_param.ndim == 2 and
+            pi0_param.shape[0] == 2 and pi0_param.shape[1:] == hf_param.shape[::-1]):
+            # Take first slice and transpose: (2, 2048, 16384) -> (2048, 16384) -> (16384, 2048)
+            return pi0_param[0].T
+        
         # Transpose 2D matrices if needed
         if (pi0_param.ndim == 2 and hf_param.ndim == 2 and 
             pi0_param.shape != hf_param.shape and pi0_param.T.shape == hf_param.shape):
@@ -236,10 +243,16 @@ class Pi0WeightInjector:
             'k': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/key/kernel"),
             'v': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/value/kernel"),
             'o': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/out/kernel"),
+            'q_bias': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/query/bias"),
+            'k_bias': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/key/bias"),
+            'v_bias': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/value/bias"),
+            'o_bias': self._find_param("img/Transformer/encoderblock/MultiHeadDotProductAttention_0/out/bias"),
             'fc1': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_0/kernel"),
             'fc2': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_1/kernel"),
+            'fc1_bias': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_0/bias"),
             'ln1': self._find_param("img/Transformer/encoderblock/LayerNorm_0/scale"),
             'ln2': self._find_param("img/Transformer/encoderblock/LayerNorm_1/scale"),
+            'ln1_bias': self._find_param("img/Transformer/encoderblock/LayerNorm_0/bias"),
         }
         
         if not any(param is not None for param in vision_params.values()):
@@ -365,6 +378,30 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.self_attn.out_proj.weight", o_reshaped, hf_state, verbose):
                 loaded += 1
         
+        # Attention biases
+        if params['q_bias'] is not None:
+            q_bias = params['q_bias'][layer_idx]  # Shape: (H, Hd)
+            q_bias_reshaped = q_bias.reshape(-1)
+            if self._copy_param(f"{prefix}.self_attn.q_proj.bias", q_bias_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['k_bias'] is not None:
+            k_bias = params['k_bias'][layer_idx]
+            k_bias_reshaped = k_bias.reshape(-1)
+            if self._copy_param(f"{prefix}.self_attn.k_proj.bias", k_bias_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['v_bias'] is not None:
+            v_bias = params['v_bias'][layer_idx]
+            v_bias_reshaped = v_bias.reshape(-1)
+            if self._copy_param(f"{prefix}.self_attn.v_proj.bias", v_bias_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['o_bias'] is not None:
+            o_bias = params['o_bias'][layer_idx]
+            if self._copy_param(f"{prefix}.self_attn.out_proj.bias", o_bias, hf_state, verbose):
+                loaded += 1
+        
         # MLP projections
         if params['fc1'] is not None:
             fc1_weight = params['fc1'][layer_idx]
@@ -376,6 +413,12 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.mlp.fc2.weight", fc2_weight, hf_state, verbose):
                 loaded += 1
         
+        # MLP bias
+        if params['fc1_bias'] is not None:
+            fc1_bias = params['fc1_bias'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.fc1.bias", fc1_bias, hf_state, verbose):
+                loaded += 1
+        
         # Layer norms
         if params['ln1'] is not None:
             ln1_weight = params['ln1'][layer_idx]
@@ -385,6 +428,12 @@ class Pi0WeightInjector:
         if params['ln2'] is not None:
             ln2_weight = params['ln2'][layer_idx]
             if self._copy_param(f"{prefix}.layer_norm2.weight", ln2_weight, hf_state, verbose):
+                loaded += 1
+        
+        # Layer norm bias
+        if params['ln1_bias'] is not None:
+            ln1_bias = params['ln1_bias'][layer_idx]
+            if self._copy_param(f"{prefix}.layer_norm1.bias", ln1_bias, hf_state, verbose):
                 loaded += 1
         
         return loaded
@@ -433,10 +482,16 @@ class Pi0WeightInjector:
             "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/key/kernel",
             "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/value/kernel", 
             "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/out/kernel",
+            "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/query/bias",
+            "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/key/bias",
+            "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/value/bias",
+            "img/Transformer/encoderblock/MultiHeadDotProductAttention_0/out/bias",
             "img/Transformer/encoderblock/MlpBlock_0/Dense_0/kernel",
             "img/Transformer/encoderblock/MlpBlock_0/Dense_1/kernel",
+            "img/Transformer/encoderblock/MlpBlock_0/Dense_0/bias",
             "img/Transformer/encoderblock/LayerNorm_0/scale",
-            "img/Transformer/encoderblock/LayerNorm_1/scale"
+            "img/Transformer/encoderblock/LayerNorm_1/scale",
+            "img/Transformer/encoderblock/LayerNorm_0/bias"
         ]
         
         # Get actual layer counts from the parameter shapes
