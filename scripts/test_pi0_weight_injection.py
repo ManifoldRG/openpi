@@ -85,6 +85,13 @@ class Pi0WeightInjector:
         # Display weights before injection
         if verbose:
             self._display_weights(hf_state, "BEFORE injection")
+            print(f"\nAvailable Pi0 parameters:")
+            for i, (key, value) in enumerate(sorted(self.pi0_main.items())):
+                if i < 20:  # Show first 20 for debugging
+                    print(f"  {key}: {value.shape}")
+                elif i == 20:
+                    print(f"  ... and {len(self.pi0_main) - 20} more parameters")
+                    break
         
         loaded_count = 0
         total_count = 0
@@ -215,7 +222,7 @@ class Pi0WeightInjector:
             return 0
             
         for i in range(num_layers):
-            loaded += self._load_llm_layer(i, layer_params, hf_state)
+            loaded += self._load_llm_layer(i, layer_params, hf_state, verbose)
         
         return loaded
     
@@ -244,7 +251,7 @@ class Pi0WeightInjector:
             return 0
             
         for i in range(num_layers):
-            loaded += self._load_vision_layer(i, vision_params, hf_state)
+            loaded += self._load_vision_layer(i, vision_params, hf_state, verbose)
         
         return loaded
     
@@ -269,7 +276,7 @@ class Pi0WeightInjector:
                 return param_array.shape[0]
         return 0
     
-    def _load_llm_layer(self, layer_idx, params, hf_state):
+    def _load_llm_layer(self, layer_idx, params, hf_state, verbose=False):
         """Load weights for a single LLM transformer layer."""
         loaded = 0
         prefix = f"language_model.model.layers.{layer_idx}"
@@ -278,15 +285,57 @@ class Pi0WeightInjector:
         if params['q'] is not None:
             q_weight = params['q'][layer_idx]  # Shape: (H, D, Hd)
             q_reshaped = np.transpose(q_weight, (0, 2, 1)).reshape(-1, q_weight.shape[1])
-            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state):
+            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state, verbose):
                 loaded += 1
         
-        # Similar for k, v, o projections...
-        # (Simplified for brevity - full implementation would handle all projections)
+        if params['k'] is not None:
+            k_weight = params['k'][layer_idx]
+            k_reshaped = np.transpose(k_weight, (0, 2, 1)).reshape(-1, k_weight.shape[1])
+            if self._copy_param(f"{prefix}.self_attn.k_proj.weight", k_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['v'] is not None:
+            v_weight = params['v'][layer_idx]
+            v_reshaped = np.transpose(v_weight, (0, 2, 1)).reshape(-1, v_weight.shape[1])
+            if self._copy_param(f"{prefix}.self_attn.v_proj.weight", v_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['o'] is not None:
+            o_weight = params['o'][layer_idx]
+            o_reshaped = o_weight.reshape(-1, o_weight.shape[-1])
+            if self._copy_param(f"{prefix}.self_attn.o_proj.weight", o_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        # MLP projections
+        if params['gate'] is not None:
+            gate_weight = params['gate'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.gate_proj.weight", gate_weight, hf_state, verbose):
+                loaded += 1
+        
+        if params['up'] is not None:
+            up_weight = params['up'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.up_proj.weight", up_weight, hf_state, verbose):
+                loaded += 1
+        
+        if params['down'] is not None:
+            down_weight = params['down'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.down_proj.weight", down_weight, hf_state, verbose):
+                loaded += 1
+        
+        # Layer norms
+        if params['attn_norm'] is not None:
+            attn_norm_weight = params['attn_norm'][layer_idx]
+            if self._copy_param(f"{prefix}.input_layernorm.weight", attn_norm_weight, hf_state, verbose):
+                loaded += 1
+        
+        if params['mlp_norm'] is not None:
+            mlp_norm_weight = params['mlp_norm'][layer_idx]
+            if self._copy_param(f"{prefix}.post_attention_layernorm.weight", mlp_norm_weight, hf_state, verbose):
+                loaded += 1
         
         return loaded
     
-    def _load_vision_layer(self, layer_idx, params, hf_state):
+    def _load_vision_layer(self, layer_idx, params, hf_state, verbose=False):
         """Load weights for a single vision transformer layer."""
         loaded = 0
         prefix = f"vision_tower.vision_model.encoder.layers.{layer_idx}"
@@ -295,24 +344,77 @@ class Pi0WeightInjector:
         if params['q'] is not None:
             q_weight = params['q'][layer_idx]  # Shape: (D, H, Hd)
             q_reshaped = np.transpose(q_weight, (2, 1, 0)).reshape(-1, q_weight.shape[0])
-            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state):
+            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state, verbose):
                 loaded += 1
         
-        # Similar for other projections...
-        # (Simplified for brevity)
+        if params['k'] is not None:
+            k_weight = params['k'][layer_idx]
+            k_reshaped = np.transpose(k_weight, (2, 1, 0)).reshape(-1, k_weight.shape[0])
+            if self._copy_param(f"{prefix}.self_attn.k_proj.weight", k_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['v'] is not None:
+            v_weight = params['v'][layer_idx]
+            v_reshaped = np.transpose(v_weight, (2, 1, 0)).reshape(-1, v_weight.shape[0])
+            if self._copy_param(f"{prefix}.self_attn.v_proj.weight", v_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        if params['o'] is not None:
+            o_weight = params['o'][layer_idx]
+            o_reshaped = o_weight.reshape(-1, o_weight.shape[-1])
+            if self._copy_param(f"{prefix}.self_attn.out_proj.weight", o_reshaped, hf_state, verbose):
+                loaded += 1
+        
+        # MLP projections
+        if params['fc1'] is not None:
+            fc1_weight = params['fc1'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.fc1.weight", fc1_weight, hf_state, verbose):
+                loaded += 1
+        
+        if params['fc2'] is not None:
+            fc2_weight = params['fc2'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.fc2.weight", fc2_weight, hf_state, verbose):
+                loaded += 1
+        
+        # Layer norms
+        if params['ln1'] is not None:
+            ln1_weight = params['ln1'][layer_idx]
+            if self._copy_param(f"{prefix}.layer_norm1.weight", ln1_weight, hf_state, verbose):
+                loaded += 1
+        
+        if params['ln2'] is not None:
+            ln2_weight = params['ln2'][layer_idx]
+            if self._copy_param(f"{prefix}.layer_norm2.weight", ln2_weight, hf_state, verbose):
+                loaded += 1
         
         return loaded
     
-    def _copy_param(self, hf_key, pi0_array, hf_state):
+    def _copy_param(self, hf_key, pi0_array, hf_state, verbose=False):
         """Copy Pi0 parameter to HF model state."""
         if hf_key not in hf_state:
+            if verbose:
+                print(f"    Missing HF key: {hf_key}")
+            return False
+        
+        hf_param = hf_state[hf_key]
+        
+        # Handle shape mismatches
+        pi0_array = self._handle_shape_mismatch(pi0_array, hf_param, hf_key)
+        
+        if pi0_array.shape != hf_param.shape:
+            if verbose:
+                print(f"    Shape mismatch {hf_key}: Pi0 {pi0_array.shape} vs HF {hf_param.shape}")
             return False
         
         try:
             with torch.no_grad():
-                hf_state[hf_key].copy_(torch.from_numpy(pi0_array))
+                hf_param.copy_(torch.from_numpy(pi0_array))
+            if verbose:
+                print(f"    ✓ Loaded {hf_key}: {pi0_array.shape}")
             return True
-        except:
+        except Exception as e:
+            if verbose:
+                print(f"    ✗ Error loading {hf_key}: {e}")
             return False
     
     def _count_available_layer_params(self):
