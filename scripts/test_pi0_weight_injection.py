@@ -65,6 +65,14 @@ class Pi0WeightInjector:
         self.pi0_weights = self._flatten_weights(pi0_weights)
         self.pi0_main = self._filter_main_weights(self.pi0_weights)
         self.weight_changes = {}  # Track weight changes during injection
+        self.replacement_log = []  # Track all replacements with detailed info
+        self.failed_replacements = []  # Track failed replacement attempts
+        self.replacement_summary = {
+            'direct_mappings': [],
+            'llm_layers': [],
+            'vision_layers': [],
+            'skipped_components': []
+        }
     
     def _flatten_weights(self, weights, prefix=""):
         """Flatten nested weight dictionary with '/' separated keys."""
@@ -123,8 +131,33 @@ class Pi0WeightInjector:
         
         # Load direct mappings
         for pi0_key, hf_key in mappings:
-            if self._load_single_param(pi0_key, hf_key, hf_state, verbose):
+            success = self._load_single_param(pi0_key, hf_key, hf_state, verbose)
+            
+            # Track replacement attempt
+            self.replacement_log.append({
+                'type': 'direct_mapping',
+                'pi0_key': pi0_key,
+                'hf_key': hf_key,
+                'success': success,
+                'pi0_shape': self.pi0_main.get(pi0_key, {}).shape if pi0_key in self.pi0_main else None,
+                'hf_shape': hf_state.get(hf_key, {}).shape if hf_key in hf_state else None
+            })
+            
+            if success:
                 loaded_count += 1
+                self.replacement_summary['direct_mappings'].append({
+                    'pi0_key': pi0_key,
+                    'hf_key': hf_key,
+                    'pi0_shape': self.pi0_main[pi0_key].shape,
+                    'hf_shape': hf_state[hf_key].shape
+                })
+            else:
+                self.failed_replacements.append({
+                    'type': 'direct_mapping',
+                    'pi0_key': pi0_key,
+                    'hf_key': hf_key,
+                    'reason': 'Parameter not found or shape mismatch'
+                })
             total_count += 1
         
         # Load layered parameters (LLM and Vision transformer layers)
@@ -302,58 +335,148 @@ class Pi0WeightInjector:
         """Load weights for a single LLM transformer layer."""
         loaded = 0
         prefix = f"language_model.model.layers.{layer_idx}"
+        layer_replacements = []
         
         # Attention projections
         if params['q'] is not None:
             q_weight = params['q'][layer_idx]  # Shape: (H, D, Hd)
             q_reshaped = np.transpose(q_weight, (0, 2, 1)).reshape(-1, q_weight.shape[1])
-            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.q_proj.weight"
+            success = self._copy_param(hf_key, q_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'q_proj',
+                'pi0_shape': q_weight.shape,
+                'hf_shape': q_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['k'] is not None:
             k_weight = params['k'][layer_idx]
             k_reshaped = np.transpose(k_weight, (0, 2, 1)).reshape(-1, k_weight.shape[1])
-            if self._copy_param(f"{prefix}.self_attn.k_proj.weight", k_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.k_proj.weight"
+            success = self._copy_param(hf_key, k_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'k_proj',
+                'pi0_shape': k_weight.shape,
+                'hf_shape': k_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['v'] is not None:
             v_weight = params['v'][layer_idx]
             v_reshaped = np.transpose(v_weight, (0, 2, 1)).reshape(-1, v_weight.shape[1])
-            if self._copy_param(f"{prefix}.self_attn.v_proj.weight", v_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.v_proj.weight"
+            success = self._copy_param(hf_key, v_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'v_proj',
+                'pi0_shape': v_weight.shape,
+                'hf_shape': v_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['o'] is not None:
             o_weight = params['o'][layer_idx]
             o_reshaped = o_weight.reshape(-1, o_weight.shape[-1])
-            if self._copy_param(f"{prefix}.self_attn.o_proj.weight", o_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.o_proj.weight"
+            success = self._copy_param(hf_key, o_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'o_proj',
+                'pi0_shape': o_weight.shape,
+                'hf_shape': o_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # MLP projections
         if params['gate'] is not None:
             gate_weight = params['gate'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.gate_proj.weight", gate_weight, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.gate_proj.weight"
+            success = self._copy_param(hf_key, gate_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'gate_proj',
+                'pi0_shape': gate_weight.shape,
+                'hf_shape': gate_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['up'] is not None:
             up_weight = params['up'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.up_proj.weight", up_weight, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.up_proj.weight"
+            success = self._copy_param(hf_key, up_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'up_proj',
+                'pi0_shape': up_weight.shape,
+                'hf_shape': up_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['down'] is not None:
             down_weight = params['down'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.down_proj.weight", down_weight, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.down_proj.weight"
+            success = self._copy_param(hf_key, down_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'down_proj',
+                'pi0_shape': down_weight.shape,
+                'hf_shape': down_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # Layer norms
         if params['attn_norm'] is not None:
             attn_norm_weight = params['attn_norm'][layer_idx]
-            if self._copy_param(f"{prefix}.input_layernorm.weight", attn_norm_weight, hf_state, verbose):
+            hf_key = f"{prefix}.input_layernorm.weight"
+            success = self._copy_param(hf_key, attn_norm_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'input_layernorm',
+                'pi0_shape': attn_norm_weight.shape,
+                'hf_shape': attn_norm_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['mlp_norm'] is not None:
             mlp_norm_weight = params['mlp_norm'][layer_idx]
-            if self._copy_param(f"{prefix}.post_attention_layernorm.weight", mlp_norm_weight, hf_state, verbose):
+            hf_key = f"{prefix}.post_attention_layernorm.weight"
+            success = self._copy_param(hf_key, mlp_norm_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'post_attention_layernorm',
+                'pi0_shape': mlp_norm_weight.shape,
+                'hf_shape': mlp_norm_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
+        
+        # Record layer summary
+        self.replacement_summary['llm_layers'].append({
+            'layer_idx': layer_idx,
+            'components': layer_replacements,
+            'total_components': len(layer_replacements),
+            'successful_components': sum(1 for r in layer_replacements if r['success'])
+        })
         
         return loaded
     
@@ -361,89 +484,224 @@ class Pi0WeightInjector:
         """Load weights for a single vision transformer layer."""
         loaded = 0
         prefix = f"vision_tower.vision_model.encoder.layers.{layer_idx}"
+        layer_replacements = []
         
         # Attention projections
         if params['q'] is not None:
             q_weight = params['q'][layer_idx]  # Shape: (D, H, Hd)
             q_reshaped = np.transpose(q_weight, (2, 1, 0)).reshape(-1, q_weight.shape[0])
-            if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.q_proj.weight"
+            success = self._copy_param(hf_key, q_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'q_proj',
+                'pi0_shape': q_weight.shape,
+                'hf_shape': q_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['k'] is not None:
             k_weight = params['k'][layer_idx]
             k_reshaped = np.transpose(k_weight, (2, 1, 0)).reshape(-1, k_weight.shape[0])
-            if self._copy_param(f"{prefix}.self_attn.k_proj.weight", k_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.k_proj.weight"
+            success = self._copy_param(hf_key, k_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'k_proj',
+                'pi0_shape': k_weight.shape,
+                'hf_shape': k_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['v'] is not None:
             v_weight = params['v'][layer_idx]
             v_reshaped = np.transpose(v_weight, (2, 1, 0)).reshape(-1, v_weight.shape[0])
-            if self._copy_param(f"{prefix}.self_attn.v_proj.weight", v_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.v_proj.weight"
+            success = self._copy_param(hf_key, v_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'v_proj',
+                'pi0_shape': v_weight.shape,
+                'hf_shape': v_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['o'] is not None:
             o_weight = params['o'][layer_idx]
             o_reshaped = o_weight.reshape(-1, o_weight.shape[-1])
-            if self._copy_param(f"{prefix}.self_attn.out_proj.weight", o_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.out_proj.weight"
+            success = self._copy_param(hf_key, o_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'out_proj',
+                'pi0_shape': o_weight.shape,
+                'hf_shape': o_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # Attention biases
         if params['q_bias'] is not None:
             q_bias = params['q_bias'][layer_idx]  # Shape: (H, Hd)
             q_bias_reshaped = q_bias.reshape(-1)
-            if self._copy_param(f"{prefix}.self_attn.q_proj.bias", q_bias_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.q_proj.bias"
+            success = self._copy_param(hf_key, q_bias_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'q_proj_bias',
+                'pi0_shape': q_bias.shape,
+                'hf_shape': q_bias_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['k_bias'] is not None:
             k_bias = params['k_bias'][layer_idx]
             k_bias_reshaped = k_bias.reshape(-1)
-            if self._copy_param(f"{prefix}.self_attn.k_proj.bias", k_bias_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.k_proj.bias"
+            success = self._copy_param(hf_key, k_bias_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'k_proj_bias',
+                'pi0_shape': k_bias.shape,
+                'hf_shape': k_bias_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['v_bias'] is not None:
             v_bias = params['v_bias'][layer_idx]
             v_bias_reshaped = v_bias.reshape(-1)
-            if self._copy_param(f"{prefix}.self_attn.v_proj.bias", v_bias_reshaped, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.v_proj.bias"
+            success = self._copy_param(hf_key, v_bias_reshaped, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'v_proj_bias',
+                'pi0_shape': v_bias.shape,
+                'hf_shape': v_bias_reshaped.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['o_bias'] is not None:
             o_bias = params['o_bias'][layer_idx]
-            if self._copy_param(f"{prefix}.self_attn.out_proj.bias", o_bias, hf_state, verbose):
+            hf_key = f"{prefix}.self_attn.out_proj.bias"
+            success = self._copy_param(hf_key, o_bias, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'out_proj_bias',
+                'pi0_shape': o_bias.shape,
+                'hf_shape': o_bias.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # MLP projections
         if params['fc1'] is not None:
             fc1_weight = params['fc1'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.fc1.weight", fc1_weight, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.fc1.weight"
+            success = self._copy_param(hf_key, fc1_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'fc1',
+                'pi0_shape': fc1_weight.shape,
+                'hf_shape': fc1_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['fc2'] is not None:
             fc2_weight = params['fc2'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.fc2.weight", fc2_weight, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.fc2.weight"
+            success = self._copy_param(hf_key, fc2_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'fc2',
+                'pi0_shape': fc2_weight.shape,
+                'hf_shape': fc2_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # MLP bias
         if params['fc1_bias'] is not None:
             fc1_bias = params['fc1_bias'][layer_idx]
-            if self._copy_param(f"{prefix}.mlp.fc1.bias", fc1_bias, hf_state, verbose):
+            hf_key = f"{prefix}.mlp.fc1.bias"
+            success = self._copy_param(hf_key, fc1_bias, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'fc1_bias',
+                'pi0_shape': fc1_bias.shape,
+                'hf_shape': fc1_bias.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # Layer norms
         if params['ln1'] is not None:
             ln1_weight = params['ln1'][layer_idx]
-            if self._copy_param(f"{prefix}.layer_norm1.weight", ln1_weight, hf_state, verbose):
+            hf_key = f"{prefix}.layer_norm1.weight"
+            success = self._copy_param(hf_key, ln1_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'layer_norm1',
+                'pi0_shape': ln1_weight.shape,
+                'hf_shape': ln1_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         if params['ln2'] is not None:
             ln2_weight = params['ln2'][layer_idx]
-            if self._copy_param(f"{prefix}.layer_norm2.weight", ln2_weight, hf_state, verbose):
+            hf_key = f"{prefix}.layer_norm2.weight"
+            success = self._copy_param(hf_key, ln2_weight, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'layer_norm2',
+                'pi0_shape': ln2_weight.shape,
+                'hf_shape': ln2_weight.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
         
         # Layer norm bias
         if params['ln1_bias'] is not None:
             ln1_bias = params['ln1_bias'][layer_idx]
-            if self._copy_param(f"{prefix}.layer_norm1.bias", ln1_bias, hf_state, verbose):
+            hf_key = f"{prefix}.layer_norm1.bias"
+            success = self._copy_param(hf_key, ln1_bias, hf_state, verbose)
+            layer_replacements.append({
+                'component': 'layer_norm1_bias',
+                'pi0_shape': ln1_bias.shape,
+                'hf_shape': ln1_bias.shape,
+                'hf_key': hf_key,
+                'success': success
+            })
+            if success:
                 loaded += 1
+        
+        # Record layer summary
+        self.replacement_summary['vision_layers'].append({
+            'layer_idx': layer_idx,
+            'components': layer_replacements,
+            'total_components': len(layer_replacements),
+            'successful_components': sum(1 for r in layer_replacements if r['success'])
+        })
         
         return loaded
     
@@ -652,6 +910,179 @@ class Pi0WeightInjector:
                 stats['avg_diff_magnitude'] = stats['total_diff_magnitude'] / stats['count']
         
         return layer_stats
+    
+    def generate_replacement_report(self, save_to_file=True, output_dir=None):
+        """Generate a comprehensive report of all weight replacements."""
+        if output_dir is None:
+            output_dir = Path("./")
+        
+        report_lines = []
+        report_lines.append("=" * 80)
+        report_lines.append("PI0 TO HUGGINGFACE PALIGEMMA WEIGHT REPLACEMENT REPORT")
+        report_lines.append("=" * 80)
+        report_lines.append(f"Generated on: {time.ctime()}")
+        report_lines.append("")
+        
+        # Summary statistics
+        total_attempted = len(self.replacement_log)
+        total_successful = sum(1 for log in self.replacement_log if log['success'])
+        total_failed = len(self.failed_replacements)
+        
+        report_lines.append("EXECUTIVE SUMMARY")
+        report_lines.append("-" * 40)
+        report_lines.append(f"Total replacement attempts: {total_attempted}")
+        report_lines.append(f"Successful replacements: {total_successful}")
+        report_lines.append(f"Failed replacements: {total_failed}")
+        report_lines.append(f"Success rate: {total_successful/max(total_attempted,1)*100:.1f}%")
+        report_lines.append("")
+        
+        # Direct mappings section
+        report_lines.append("1. DIRECT PARAMETER MAPPINGS")
+        report_lines.append("-" * 50)
+        if self.replacement_summary['direct_mappings']:
+            for mapping in self.replacement_summary['direct_mappings']:
+                report_lines.append(f"✓ {mapping['pi0_key']}")
+                report_lines.append(f"  -> {mapping['hf_key']}")
+                report_lines.append(f"  Pi0 shape: {mapping['pi0_shape']}")
+                report_lines.append(f"  HF shape:  {mapping['hf_shape']}")
+                report_lines.append("")
+        else:
+            report_lines.append("No successful direct mappings found.")
+            report_lines.append("")
+        
+        # LLM layers section
+        report_lines.append("2. LANGUAGE MODEL TRANSFORMER LAYERS")
+        report_lines.append("-" * 50)
+        if self.replacement_summary['llm_layers']:
+            for layer in self.replacement_summary['llm_layers']:
+                layer_idx = layer['layer_idx']
+                success_count = layer['successful_components']
+                total_count = layer['total_components']
+                
+                report_lines.append(f"Layer {layer_idx}: {success_count}/{total_count} components replaced")
+                
+                for component in layer['components']:
+                    status = "✓" if component['success'] else "✗"
+                    report_lines.append(f"  {status} {component['component']}: {component['pi0_shape']} -> {component['hf_shape']}")
+                    report_lines.append(f"    HF key: {component['hf_key']}")
+                
+                report_lines.append("")
+        else:
+            report_lines.append("No LLM layers processed.")
+            report_lines.append("")
+        
+        # Vision layers section  
+        report_lines.append("3. VISION TRANSFORMER LAYERS")
+        report_lines.append("-" * 50)
+        if self.replacement_summary['vision_layers']:
+            for layer in self.replacement_summary['vision_layers']:
+                layer_idx = layer['layer_idx']
+                success_count = layer['successful_components']
+                total_count = layer['total_components']
+                
+                report_lines.append(f"Vision Layer {layer_idx}: {success_count}/{total_count} components replaced")
+                
+                for component in layer['components']:
+                    status = "✓" if component['success'] else "✗"
+                    report_lines.append(f"  {status} {component['component']}: {component['pi0_shape']} -> {component['hf_shape']}")
+                    report_lines.append(f"    HF key: {component['hf_key']}")
+                
+                report_lines.append("")
+        else:
+            report_lines.append("No vision layers processed.")
+            report_lines.append("")
+        
+        # Failed replacements section
+        if self.failed_replacements:
+            report_lines.append("4. FAILED REPLACEMENTS")
+            report_lines.append("-" * 50)
+            for failure in self.failed_replacements:
+                report_lines.append(f"✗ {failure['pi0_key']} -> {failure['hf_key']}")
+                report_lines.append(f"  Reason: {failure['reason']}")
+                report_lines.append("")
+        
+        # Excluded components section
+        report_lines.append("5. EXCLUDED COMPONENTS (Action Expert)")
+        report_lines.append("-" * 50)
+        excluded_count = 0
+        for key in self.pi0_weights.keys():
+            if any(part.endswith("_1") for part in key.split("/")):
+                excluded_count += 1
+                if excluded_count <= 10:  # Show first 10
+                    report_lines.append(f"  {key}")
+        
+        if excluded_count > 10:
+            report_lines.append(f"  ... and {excluded_count - 10} more action expert components")
+        
+        report_lines.append(f"\nTotal excluded components: {excluded_count}")
+        report_lines.append("")
+        
+        # Weight change statistics
+        if self.weight_changes:
+            report_lines.append("6. WEIGHT CHANGE STATISTICS")
+            report_lines.append("-" * 50)
+            
+            all_relative_changes = [change['relative_change'] for change in self.weight_changes.values()]
+            all_diff_magnitudes = [change['diff_magnitude'] for change in self.weight_changes.values()]
+            
+            report_lines.append(f"Parameters changed: {len(self.weight_changes)}")
+            report_lines.append(f"Mean relative change: {np.mean(all_relative_changes):.6f}")
+            report_lines.append(f"Std relative change: {np.std(all_relative_changes):.6f}")
+            report_lines.append(f"Max relative change: {np.max(all_relative_changes):.6f}")
+            report_lines.append(f"Min relative change: {np.min(all_relative_changes):.6f}")
+            report_lines.append(f"Mean diff magnitude: {np.mean(all_diff_magnitudes):.6f}")
+            report_lines.append("")
+            
+            # Top 5 largest changes
+            sorted_changes = sorted(self.weight_changes.items(), 
+                                  key=lambda x: x[1]['relative_change'], reverse=True)
+            
+            report_lines.append("Top 5 Largest Relative Changes:")
+            for i, (param_name, change) in enumerate(sorted_changes[:5]):
+                short_name = param_name.split('.')[-2:] if '.' in param_name else [param_name]
+                short_name = '.'.join(short_name)
+                report_lines.append(f"  {i+1}. {short_name}: {change['relative_change']:.6f}")
+                report_lines.append(f"     Shape: {change['shape']}, Diff magnitude: {change['diff_magnitude']:.6f}")
+            
+            report_lines.append("")
+        
+        # Component type summary
+        report_lines.append("7. COMPONENT TYPE SUMMARY")
+        report_lines.append("-" * 50)
+        
+        # Count by component type
+        component_types = {}
+        for log in self.replacement_log:
+            if log['success']:
+                if log['type'] == 'direct_mapping':
+                    comp_type = log['pi0_key'].split('/')[-1]
+                else:
+                    comp_type = log.get('component', 'unknown')
+                
+                if comp_type not in component_types:
+                    component_types[comp_type] = 0
+                component_types[comp_type] += 1
+        
+        for comp_type, count in sorted(component_types.items()):
+            report_lines.append(f"  {comp_type}: {count} replacements")
+        
+        report_lines.append("")
+        report_lines.append("=" * 80)
+        report_lines.append("END OF REPORT")
+        report_lines.append("=" * 80)
+        
+        # Join all lines
+        report_text = "\n".join(report_lines)
+        
+        # Save to file if requested
+        if save_to_file:
+            timestamp = int(time.time())
+            report_file = output_dir / f"weight_replacement_report_{timestamp}.txt"
+            with open(report_file, 'w') as f:
+                f.write(report_text)
+            print(f"\n📊 Weight replacement report saved to: {report_file}")
+        
+        return report_text
 
 
 def load_pi0_weights():
@@ -718,6 +1149,30 @@ def test_model_generation(model, processor, model_name):
     
     return results
 
+def get_weight_injected_model():
+    """Load and return a Pi0 weight-injected Paligemma model."""
+    model_id = "google/paligemma-3b-pt-224"
+    processor = AutoProcessor.from_pretrained(model_id)
+    print(f"✓ Loaded processor for {model_id}")
+    
+    
+    # Test Pi0-injected model
+    print("\n2. Testing Pi0-injected model...")
+    pi0_model = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
+    pi0_weights = load_pi0_weights()
+    if pi0_weights is None:
+        print("✗ Failed to load Pi0 weights")
+        return None, None
+    
+    injector = Pi0WeightInjector(pi0_weights)
+    if injector.inject_weights(pi0_model, verbose=True):
+        print("✓ Pi0 weights injected successfully")
+        return pi0_model, processor
+    else:
+        print("✗ Pi0 weight injection failed")
+        return None, None
+
+
 
 def main():
     """Main test execution."""
@@ -755,6 +1210,9 @@ def main():
         weight_stats = injector.analyze_weight_changes(verbose=True)
         layer_summary = injector.get_layer_change_summary()
         
+        # Generate comprehensive replacement report
+        replacement_report = injector.generate_replacement_report(save_to_file=True, output_dir=output_dir)
+        
         print(f"\n{'='*60}")
         print("LAYER-WISE CHANGE SUMMARY")
         print(f"{'='*60}")
@@ -779,7 +1237,10 @@ def main():
         "weight_analysis": {
             "overall_stats": weight_stats,
             "layer_summary": layer_summary,
-            "detailed_changes": injector.weight_changes
+            "detailed_changes": injector.weight_changes,
+            "replacement_summary": injector.replacement_summary,
+            "replacement_log": injector.replacement_log,
+            "failed_replacements": injector.failed_replacements
         }
     }
     

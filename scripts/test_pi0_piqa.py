@@ -1,0 +1,417 @@
+import argparse
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass, field, fields
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import tensorflow as tf
+import gc
+
+import torch
+
+# Add the project root to the path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../../')))
+# Add the OpenPI src directory to the path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+# Add the openpi source directory to sys.path (same as pi0.py does)
+openpi_src_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../src'))
+if openpi_src_path not in sys.path:
+    sys.path.insert(0, openpi_src_path)
+
+from src.eval_utils import (get_exact_match_rate,
+                            calculate_tp_fp_fn_counts,
+                            get_micro_precision_from_counts, 
+                            get_micro_recall_from_counts, 
+                            get_micro_f1)
+
+# Import PIQA dataloader
+from src.data_utils.piqa_dataloader import get_piqa_test_dataloader
+# import the pi0 policy
+from src.v1.modules.openpi.src.openpi.models import pi0
+from src.v1.modules.openpi.src.openpi.models import model as _model
+from src.v1.modules.openpi.src.openpi.transforms import TokenizePrompt, _tokenizer
+from src.v1.modules.openpi.src.openpi.policies.piqa_policy import PiqaInputs
+from src.v1.modules.openpi.scripts.serve_policy import create_policy
+from src.v1.modules.openpi.src.openpi.shared import download
+from src.v1.modules.openpi.src.openpi.policies import policy as _policy
+from src.v1.modules.openpi.src.openpi.policies import policy_config as _policy_config
+from src.v1.modules.openpi.src.openpi.training import config as _config
+from src.v1.modules.openpi.src.openpi.training.weight_loaders import PaliGemmaWeightLoader
+from test_pi0_weight_injection import get_weight_injected_model
+
+# Restrict tf to CPU
+#tf.config.set_visible_devices([], "GPU")
+
+
+@dataclass
+class DatasetResults:
+    """Results from PIQA model inference evaluation"""
+    all_preds: list[list[float]] = field(default_factory=list)
+    all_gt: list[list[float]] = field(default_factory=list)
+    
+    total_batches: int = 0
+    total_timesteps: int = 0
+    eval_time: float = 0
+    total_invalid_predictions: int = 0
+    invalid_predictions_percentage: float = 0
+    total_emr: float = 0
+    total_micro_precision: float = 0
+    total_micro_recall: float = 0
+    total_micro_f1: float = 0
+    avg_emr: float = 0
+    avg_micro_precision: float = 0
+    avg_micro_recall: float = 0
+    avg_micro_f1: float = 0
+    total_clipped_emr: float = 0
+    total_clipped_micro_precision: float = 0
+    total_clipped_micro_recall: float = 0
+    total_clipped_micro_f1: float = 0
+    avg_clipped_emr: float = 0
+    avg_clipped_micro_precision: float = 0
+    avg_clipped_micro_recall: float = 0
+    avg_clipped_micro_f1: float = 0
+    total_micro_precision_without_invalids: float = 0
+    total_micro_f1_without_invalids: float = 0
+    avg_micro_precision_without_invalids: float = 0
+    avg_micro_f1_without_invalids: float = 0
+
+    def to_dict(self) -> dict:
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+        }
+
+
+class PIQAInference:
+    """PIQA inference class for model evaluation"""
+    
+    def __init__(self):
+        pass
+
+    def get_base_model(self) -> pi0.Pi0:
+        """Load the pi0 model with base paligemma weights"""
+        import jax
+        import flax.nnx as nnx
+        
+        # Create the model configuration
+        config = pi0.Pi0Config(action_horizon=1)
+        
+        # Create model without loading Pi0 trained weights
+        rng = jax.random.PRNGKey(0)
+        model = config.create(rng)
+        
+        # Extract model parameters in the format expected by weight loader
+        model_state = nnx.state(model, nnx.Param)
+        
+        # Convert nnx.State to pure dict format expected by weight loader
+        model_params = model_state.to_pure_dict()
+        
+        # Use PaliGemmaWeightLoader to load base weights
+        weight_loader = PaliGemmaWeightLoader()
+        loaded_params = weight_loader.load(model_params)
+        
+        # Update model with base PaliGemma weights
+        # Convert loaded params back to nnx.State and update model
+        model_state.replace_by_pure_dict(loaded_params)
+        nnx.update(model, model_state)
+        
+        return model
+
+
+    def evaluate_model(self, processor, model, dataloader, max_samples=None) -> dict:
+        """Evaluate the model on PIQA dataset
+
+        Args:
+            processor: The data processor for input preprocessing
+            model: The pi0 model to evaluate
+            dataloader: Data loader for PIQA dataset
+            max_samples: Optional maximum number of samples to process
+
+        Returns:
+            Dictionary containing evaluation results
+        """  
+        counter = 0
+        dataset_results = DatasetResults()
+
+        start_time = time.perf_counter()
+
+        samples_processed = 0
+    
+
+        for batch in dataloader:
+            # Process entire batch at once
+            actual_batch_size = len(batch['goal'])  # PIQA dataloader returns goal, sol1, sol2, etc.
+            
+            # Format PIQA prompts for each sample in the batch
+            predictions = np.zeros((actual_batch_size,), dtype=int) - 1  # Initialize with -1 (invalid)
+
+            # Batch processing
+            # For each sample, prepare element for client inference
+            try:
+                # Prepare the entire batch at once instead of individual samples
+                # element = {
+                #     "prompt": batch['question'],  # Pass the entire batch of questions
+                # }
+                # # Prepare the batch observation
+                # observation_batch = self.prepare_observation(element)
+
+                # generate a dummy image tensor
+                dummy_image = torch.zeros(3, 224, 224)
+                # make a batch of dummy images
+                dummy_images = torch.stack([dummy_image] * actual_batch_size).to("cuda")
+                # add in front of the question an image token '<image>'
+                batch['question'] = ['<image> ' + q for q in batch['question']]
+
+                inputs = processor(text=batch['question'], images=dummy_images,
+                  padding="longest", do_convert_rgb=True, return_tensors="pt").to("cuda")
+                
+                # batch query the model
+                inputs.to(dtype=model.dtype)
+                inputs.to(model.device)
+                with torch.no_grad():
+                  output = model.generate(**inputs, max_new_tokens=200)
+                response = [processor.decode(out, skip_special_tokens=True) for out in output]
+                print(response)
+
+                # Query model with a autoregressive loop
+                # while the last output token is not the end token and we haven't reached max length
+                # response = model._vlm_inference_step(rng=jax.random.PRNGKey(0), observation=observation_batch)
+                # while response[0][-1] != _tokenizer.PaligemmaTokenizer.END_TOKEN and len(response[0]) < 10:
+                #     # Continue generating
+                #     response = model._vlm_inference_step(rng=jax.random.PRNGKey(0), observation=observation_batch)
+                # Query pi0 model with the batch
+        
+                
+                # Extract binary choice from generated text
+                # For now, use a simple extraction since we don't have label/correct_solution here
+                predictions = self.process_batch_text_response(response)
+                samples_processed += actual_batch_size
+                if max_samples is not None and samples_processed >= max_samples:
+                    break
+
+            except Exception as e:
+                print(f"Error during inference for batch {counter}: {e}")
+                # throw exception to avoid silent failures
+                raise e
+            
+            print(f"Batch {counter} processed {actual_batch_size} samples")
+            print(f"Sample prompt: {batch['question'][0]}...")
+            
+            counter += 1
+
+            # Get ground truth labels from batch
+            gt_labels = np.array(batch['label'])
+            
+            print(f'Ground truth labels: {gt_labels}')
+            print(f'Predicted labels: {predictions}')
+
+            # Calculate metrics
+            emr = get_exact_match_rate(predictions, gt_labels)
+            action_space = [0, 1]  # Binary classification
+            
+            # Calculate metrics counts
+            total_tp, total_fp, total_fn, valid_fp, invalid_fp = calculate_tp_fp_fn_counts(
+                predictions, gt_labels, action_space
+            )
+
+            # Calculate all metrics
+            micro_precision = get_micro_precision_from_counts(total_tp, total_fp)
+            micro_recall = get_micro_recall_from_counts(total_tp, total_fn)
+            micro_f1 = get_micro_f1(micro_precision, micro_recall)
+            
+            print(f"Micro Precision: {micro_precision}, Micro Recall: {micro_recall}, Micro F1: {micro_f1}")
+            
+            # Store results for this batch
+            dataset_results.all_preds.extend(predictions.tolist() if hasattr(predictions, 'tolist') else predictions)
+            dataset_results.all_gt.extend(gt_labels.tolist())
+            dataset_results.total_invalid_predictions += int(invalid_fp)
+            dataset_results.total_batches = counter
+            dataset_results.total_timesteps += len(predictions)
+            dataset_results.total_emr += emr
+            dataset_results.total_micro_precision += micro_precision
+            dataset_results.total_micro_recall += micro_recall
+            dataset_results.total_micro_f1 += micro_f1
+
+            # Memory management
+            gc.collect()
+            print(f"Processed {counter} batches, cleared memory")
+
+
+        end_time = time.perf_counter()
+        eval_duration = end_time - start_time
+        dataset_results.eval_time = eval_duration
+        dataset_results.avg_emr = dataset_results.total_emr / dataset_results.total_timesteps if dataset_results.total_timesteps > 0 else 0
+        dataset_results.invalid_predictions_percentage = dataset_results.total_invalid_predictions / dataset_results.total_timesteps * 100 if dataset_results.total_timesteps > 0 else 0
+        dataset_results.avg_micro_precision = dataset_results.total_micro_precision / dataset_results.total_timesteps if dataset_results.total_timesteps > 0 else 0
+        dataset_results.avg_micro_recall = dataset_results.total_micro_recall / dataset_results.total_timesteps if dataset_results.total_timesteps > 0 else 0
+        dataset_results.avg_micro_f1 = dataset_results.total_micro_f1 / dataset_results.total_timesteps if dataset_results.total_timesteps > 0 else 0
+
+        return dataset_results.to_dict()
+
+    def prepare_observation(self, element: dict, max_token_len:int=300) -> dict:
+        """Prepare observation dictionary for model inference
+        
+        Args:
+            element: Dictionary containing input data (e.g., prompt)
+            max_token_len: Maximum token length for prompt tokenization
+
+        Returns:
+            Prepared observation dictionary
+        """
+        # Ensure prompt is a list for consistent processing
+        if isinstance(element['prompt'], str):
+            element['prompt'] = [element['prompt']]
+        # If it's already a list but not numpy array, keep as is
+        elif isinstance(element['prompt'], list):
+            pass
+        else:
+            # Convert other types to list
+            element['prompt'] = list(element['prompt'])
+
+        #element = jax.tree.map(lambda x: x, element)
+        element = PiqaInputs()(element)
+        # tokenize the prompt
+        element = TokenizePrompt(_tokenizer.PaligemmaTokenizer(max_token_len))(element)
+        # convert to jax.Array.
+        element = jax.tree.map(lambda x: jnp.asarray(x)[...], element)
+        # Use the Observation from the pi0 module to ensure type compatibility
+        observation = pi0._model.Observation.from_dict(element)
+        return observation
+
+    def process_batch_text_response(self, generated_texts: list[str]) -> int:
+        """Process a batch of generated texts response to extract binary choice
+        
+        Args:
+            generated_texts: Generated text responses from the model
+
+        Returns:
+            Binary predictions (0 or 1, -1 for invalid)
+        """
+        # compare with labels to determine correctness. Generated text should either be 0 or 1, and must match the label
+        def safe_int(x):
+            try:
+                return int(x)
+            except ValueError:
+                return -1
+        vec_safe_int = np.vectorize(safe_int)
+        # Convert generated texts to integers safely
+        generated_texts = vec_safe_int(generated_texts)
+        return generated_texts
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse and validate command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Run inference on PIQA dataset with model evaluation"
+    )
+    
+    parser.add_argument(
+        '--dataset_dir',
+        type=str,
+        default= '../../../processed_datasets/piqa/test/', 
+        #default = 'src/v1/processed_datasets/piqa/test/',
+        help='Directory containing the PIQA dataset (default: ../../../processed_datasets/piqa/test/)'
+    )
+    
+    
+    parser.add_argument(
+        '--output_dir',
+        type=str,
+        default='./piqa_inference_results',
+        help='Directory to store inference results (default: ./piqa_inference_results)'
+    )
+    
+    parser.add_argument(
+        '--batch_size',
+        type=int,
+        default=4,
+        help='Batch size for inference (default: 32)'
+    )
+    
+    parser.add_argument(
+        '--max_samples',
+        type=int,
+        default=None,
+        help='Maximum number of samples to process (default: all samples)'
+    )
+
+    parser.add_argument(
+        '--device',
+        type=str,
+        default='cuda'if torch.cuda.is_available() else 'cpu',
+        help='Device to run the model on (default: cuda)'
+    )
+     
+    
+    args = parser.parse_args()
+    
+    # Validate dataset directory exists
+    if not os.path.exists(args.dataset_dir):
+        raise FileNotFoundError(f"Dataset directory not found: {args.dataset_dir}")
+    
+    return args
+
+
+def main():
+    """Main function to run PIQA inference or analysis"""
+    # Parse arguments
+    args = parse_args()
+    
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+    print(f"Results will be stored in: {args.output_dir}")
+    print(f"Reading PIQA dataset from: {args.dataset_dir}")
+
+    # config = pi0.Pi0Config(action_horizon=1)
+    # model = config.load(_model.restore_params(download.maybe_download("s3://openpi-assets/checkpoints/pi0_base/params")))
+    # model = get_base_model()
+
+    print('Model loaded')
+    try:
+        piqa_inference = PIQAInference()
+        # model = piqa_inference.get_base_model()  # Load and prepare the model
+        # Create PIQA dataloader using the piqa_dataloader module
+        model, processor = get_weight_injected_model()
+        dataset_obj, dataloader = get_piqa_test_dataloader(
+            test_dir=args.dataset_dir, 
+            batch_size=args.batch_size
+        )
+        
+        print(f"Created dataloader with {len(dataset_obj)} samples")
+        
+        # Run inference
+        results = piqa_inference.evaluate_model(
+            processor, model, dataloader, max_samples=args.max_samples
+        )
+        
+        results_file = os.path.join(args.output_dir, 'piqa_inference_results.json')
+        
+        # Save results
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=4)
+            
+        print(f"Inference results saved to: {results_file}")
+        
+        # Print summary
+        print(f"\n=== PIQA Inference Results Summary ===")
+        print(f"Total timesteps: {results.get('total_timesteps', 0)}")
+        print(f"Average EMR: {results.get('avg_emr', 0):.3f}")
+        print(f"Average Micro F1: {results.get('avg_micro_f1', 0):.3f}")
+        print(f"Average Micro Precision: {results.get('avg_micro_precision', 0):.3f}")
+        print(f"Average Micro Recall: {results.get('avg_micro_recall', 0):.3f}")
+        print(f"Evaluation time: {results.get('eval_time', 0):.2f} seconds")
+        
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        return 1
+    
+    return 0
+
+
+if __name__ == "__main__":
+    exit(main())
