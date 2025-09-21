@@ -42,6 +42,13 @@ TEST_IMAGES = [
     {"id": "397133", "url": "http://images.cocodataset.org/val2017/000000397133.jpg"},
     {"id": "037777", "url": "http://images.cocodataset.org/val2017/000000037777.jpg"},
     {"id": "252219", "url": "http://images.cocodataset.org/val2017/000000252219.jpg"},
+    {"id": "289343", "url": "http://images.cocodataset.org/val2017/000000289343.jpg"},
+    {"id": "61471", "url": "http://images.cocodataset.org/val2017/000000061471.jpg"},
+    {"id": "184791", "url": "http://images.cocodataset.org/val2017/000000184791.jpg"},
+    {"id": "403385", "url": "http://images.cocodataset.org/val2017/000000403385.jpg"},
+    {"id": "6818", "url": "http://images.cocodataset.org/val2017/000000006818.jpg"},
+    {"id": "480985", "url": "http://images.cocodataset.org/val2017/000000480985.jpg"},
+    {"id": "458755", "url": "http://images.cocodataset.org/val2017/000000458755.jpg"},
 ]
 
 PROMPTS = [
@@ -685,8 +692,8 @@ def test_model_generation(model, processor, model_name):
             
             # Test each prompt
             for prompt, description in PROMPTS:
-                # need to add '<image>' token to the beginning of prompt
-                inputs = processor(image, f"<image> {prompt}",  return_tensors="pt")
+                # Prepare inputs properly for PaliGemma
+                inputs = processor(images=image, text=prompt, return_tensors="pt")
 
                 with torch.no_grad():
                     outputs = model.generate(
