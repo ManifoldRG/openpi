@@ -38,17 +38,18 @@ from src.eval.profiling.openpi.src.openpi.models import model as _model
 from src.eval.profiling.openpi.src.openpi.shared import download
 
 # Test configuration
+COCO_TEST_IMAGES = [
+    {"id": "000000397133"},
+    {"id": "000000037777"},
+    {"id": "000000252219"},
+    {"id": "000000087038"},
+    {"id": "000000174482"}
+]
+
+# Generate URLs for the test images
 TEST_IMAGES = [
-    {"id": "397133", "url": "http://images.cocodataset.org/val2017/000000397133.jpg"},
-    {"id": "037777", "url": "http://images.cocodataset.org/val2017/000000037777.jpg"},
-    {"id": "252219", "url": "http://images.cocodataset.org/val2017/000000252219.jpg"},
-    {"id": "289343", "url": "http://images.cocodataset.org/val2017/000000289343.jpg"},
-    {"id": "61471", "url": "http://images.cocodataset.org/val2017/000000061471.jpg"},
-    {"id": "184791", "url": "http://images.cocodataset.org/val2017/000000184791.jpg"},
-    {"id": "403385", "url": "http://images.cocodataset.org/val2017/000000403385.jpg"},
-    {"id": "6818", "url": "http://images.cocodataset.org/val2017/000000006818.jpg"},
-    {"id": "480985", "url": "http://images.cocodataset.org/val2017/000000480985.jpg"},
-    {"id": "458755", "url": "http://images.cocodataset.org/val2017/000000458755.jpg"},
+    {"id": img["id"], "url": f"http://images.cocodataset.org/val2017/{img['id']}.jpg"}
+    for img in COCO_TEST_IMAGES
 ]
 
 PROMPTS = [
