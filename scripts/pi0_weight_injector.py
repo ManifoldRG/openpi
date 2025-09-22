@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 import numpy as np
 import torch
-import logging
+# import logging  # Removed - using print statements instead
 
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../../../')))
@@ -33,9 +33,7 @@ from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
 from src.eval.profiling.openpi.src.openpi.models import model as _model
 from src.eval.profiling.openpi.src.openpi.shared import download
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Logging setup removed - using print statements for output
 
 
 class Pi0WeightInjector:
@@ -77,7 +75,7 @@ class Pi0WeightInjector:
         Returns:
             bool: True if injection was successful
         """
-        logger.info("Starting Pi0 weight injection...")
+        print("Starting Pi0 weight injection...")
         hf_state = hf_model.state_dict()
         
         loaded_count = 0
@@ -114,13 +112,13 @@ class Pi0WeightInjector:
         total_count += self._count_available_layer_params()
         
         success_rate = loaded_count / max(total_count, 1)
-        logger.info(f"Loaded {loaded_count}/{total_count} parameters ({success_rate:.1%})")
+        print(f"Loaded {loaded_count}/{total_count} parameters ({success_rate:.1%})")
         
         if success_rate > 0.5:
-            logger.info("✓ Pi0 weight injection successful")
+            print("✓ Pi0 weight injection successful")
             return True
         else:
-            logger.error("✗ Pi0 weight injection failed - insufficient parameters loaded")
+            print("✗ Pi0 weight injection failed - insufficient parameters loaded")
             return False
     
     def _load_single_param(self, pi0_key, hf_key, hf_state):
@@ -135,7 +133,7 @@ class Pi0WeightInjector:
         pi0_param = self._handle_shape_mismatch(pi0_param, hf_param, hf_key)
         
         if pi0_param.shape != hf_param.shape:
-            logger.warning(f"Shape mismatch {hf_key}: {pi0_param.shape} vs {hf_param.shape}")
+            print(f"Warning: Shape mismatch {hf_key}: {pi0_param.shape} vs {hf_param.shape}")
             return False
         
         try:
@@ -143,7 +141,7 @@ class Pi0WeightInjector:
                 hf_param.copy_(torch.from_numpy(pi0_param))
             return True
         except Exception as e:
-            logger.error(f"Error loading {hf_key}: {e}")
+            print(f"Error loading {hf_key}: {e}")
             return False
     
     def _handle_shape_mismatch(self, pi0_param, hf_param, param_name):
@@ -216,7 +214,7 @@ class Pi0WeightInjector:
         for i in range(num_layers):
             loaded += self._load_llm_layer(i, layer_params, hf_state)
         
-        logger.info(f"Loaded {loaded} LLM layer parameters across {num_layers} layers")
+        print(f"Loaded {loaded} LLM layer parameters across {num_layers} layers")
         return loaded
     
     def _load_vision_layers(self, hf_state):
@@ -252,7 +250,7 @@ class Pi0WeightInjector:
         for i in range(num_layers):
             loaded += self._load_vision_layer(i, vision_params, hf_state)
         
-        logger.info(f"Loaded {loaded} vision layer parameters across {num_layers} layers")
+        print(f"Loaded {loaded} vision layer parameters across {num_layers} layers")
         return loaded
     
     def _find_param(self, suffix):
@@ -441,7 +439,7 @@ class Pi0WeightInjector:
                 hf_param.copy_(torch.from_numpy(pi0_array))
             return True
         except Exception as e:
-            logger.error(f"Error copying parameter {hf_key}: {e}")
+            print(f"Error copying parameter {hf_key}: {e}")
             return False
     
     def _count_available_layer_params(self):
@@ -499,7 +497,7 @@ class Pi0WeightInjector:
 
 def load_pi0_weights():
     """Load Pi0 checkpoint weights."""
-    logger.info("Loading Pi0 weights...")
+    print("Loading Pi0 weights...")
     try:
         pi0_params = _model.restore_params(
             download.maybe_download("gs://openpi-assets/checkpoints/pi0_base/params"),
@@ -510,11 +508,11 @@ def load_pi0_weights():
         if not pi0_weights:
             raise ValueError("PaliGemma weights not found in Pi0 checkpoint")
         
-        logger.info("✓ Pi0 weights loaded successfully")
+        print("✓ Pi0 weights loaded successfully")
         return pi0_weights
     
     except Exception as e:
-        logger.error(f"✗ Failed to load Pi0 weights: {e}")
+        print(f"✗ Failed to load Pi0 weights: {e}")
         raise
 
 
@@ -534,21 +532,21 @@ def get_pi0_injected_model(model_id="google/paligemma-3b-pt-224", device=None):
         RuntimeError: If weight injection fails
         Exception: If model or processor loading fails
     """
-    logger.info(f"Creating Pi0 weight-injected model from {model_id}")
+    print(f"Creating Pi0 weight-injected model from {model_id}")
     
     try:
         # Load processor
         processor = AutoProcessor.from_pretrained(model_id)
-        logger.info("✓ Loaded processor")
+        print("✓ Loaded processor")
         
         # Load base model
         model = PaliGemmaForConditionalGeneration.from_pretrained(model_id)
-        logger.info("✓ Loaded base model")
+        print("✓ Loaded base model")
         
         # Move to device if specified
         if device is not None:
             model = model.to(device)
-            logger.info(f"✓ Moved model to {device}")
+            print(f"✓ Moved model to {device}")
         
         # Load Pi0 weights
         pi0_weights = load_pi0_weights()
@@ -558,11 +556,11 @@ def get_pi0_injected_model(model_id="google/paligemma-3b-pt-224", device=None):
         if not injector.inject_weights(model):
             raise RuntimeError("Pi0 weight injection failed")
         
-        logger.info("✓ Pi0 weight-injected model ready for inference")
+        print("✓ Pi0 weight-injected model ready for inference")
         return model, processor
         
     except Exception as e:
-        logger.error(f"Failed to create Pi0 weight-injected model: {e}")
+        print(f"Failed to create Pi0 weight-injected model: {e}")
         raise
 
 
@@ -599,10 +597,10 @@ def main():
         input_len = inputs["input_ids"].shape[-1]
         generated_text = processor.decode(outputs[0][input_len:], skip_special_tokens=True)
         
-        logger.info(f"Generated caption: '{generated_text}'")
+        print(f"Generated caption: '{generated_text}'")
         
     except Exception as e:
-        logger.error(f"Inference example failed: {e}")
+        print(f"Inference example failed: {e}")
 
 
 if __name__ == "__main__":
