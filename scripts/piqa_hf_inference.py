@@ -209,9 +209,7 @@ class PIQAInferenceHF:
                 **inputs,
                 max_new_tokens=10,  # We only need 1 token ("0" or "1"), but allow some buffer
                 do_sample=False,  # Use greedy decoding for consistency
-                pad_token_id=self.processor.tokenizer.eos_token_id,
-                temperature=0.1,
-                top_p=0.9
+                pad_token_id=self.processor.tokenizer.eos_token_id
             )
         
         # Decode only the generated part (excluding the input prompt)
