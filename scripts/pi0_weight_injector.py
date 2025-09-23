@@ -152,12 +152,12 @@ class Pi0WeightInjector:
             pi0_param.shape[0] == 1 and pi0_param.shape[1:] == hf_param.shape):
             return np.squeeze(pi0_param, axis=0)
         
-        # Handle MLP gate/up projection shape mismatch: (2, D, H) -> (H, D)
+        # Handle MLP gate/up projection transpose: (D, H) -> (H, D)
+
         if (("gate_proj.weight" in param_name or "up_proj.weight" in param_name) and 
-            pi0_param.ndim == 3 and hf_param.ndim == 2 and
-            pi0_param.shape[0] == 2 and pi0_param.shape[1:] == hf_param.shape[::-1]):
-            # Take first slice and transpose: (2, 2048, 16384) -> (2048, 16384) -> (16384, 2048)
-            return pi0_param[0].T
+            pi0_param.ndim == 2 and hf_param.ndim == 2 and
+            pi0_param.T.shape == hf_param.shape):
+            return pi0_param.T
         
         # Transpose 2D matrices if needed
         if (pi0_param.ndim == 2 and hf_param.ndim == 2 and 
@@ -196,8 +196,7 @@ class Pi0WeightInjector:
             'k': self._find_param("llm/layers/attn/k_einsum/w"),
             'v': self._find_param("llm/layers/attn/v_einsum/w"),
             'o': self._find_param("llm/layers/attn/attn_vec_einsum/w"),
-            'gate': self._find_param("llm/layers/mlp/gating_einsum"),
-            'up': self._find_param("llm/layers/mlp/up_einsum"),
+            'gating': self._find_param("llm/layers/mlp/gating_einsum"),
             'down': self._find_param("llm/layers/mlp/linear"),
             'attn_norm': self._find_param("llm/layers/attn_norm/scale"),
             'mlp_norm': self._find_param("llm/layers/mlp_norm/scale"),
@@ -302,14 +301,14 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.self_attn.o_proj.weight", o_reshaped, hf_state):
                 loaded += 1
         
-        # MLP projections
-        if params['gate'] is not None:
-            gate_weight = params['gate'][layer_idx]
+        # MLP projections - handle gating_einsum that contains both gate and up weights
+        if params['gating'] is not None:
+            gating_weight = params['gating'][layer_idx]  # Shape: (2, D, H)
+            gate_weight = gating_weight[0]  # Shape: (D, H)
+            up_weight = gating_weight[1]    # Shape: (D, H)
+            
             if self._copy_param(f"{prefix}.mlp.gate_proj.weight", gate_weight, hf_state):
                 loaded += 1
-        
-        if params['up'] is not None:
-            up_weight = params['up'][layer_idx]
             if self._copy_param(f"{prefix}.mlp.up_proj.weight", up_weight, hf_state):
                 loaded += 1
         
