@@ -447,7 +447,7 @@ class Pi0WeightInjector:
         llm_param_suffixes = [
             "llm/layers/attn/q_einsum/w", "llm/layers/attn/k_einsum/w", 
             "llm/layers/attn/v_einsum/w", "llm/layers/attn/attn_vec_einsum/w",
-            "llm/layers/mlp/gating_einsum", "llm/layers/mlp/up_einsum", "llm/layers/mlp/linear",
+            "llm/layers/mlp/gating_einsum", "llm/layers/mlp/linear",
             "llm/layers/attn_norm/scale", "llm/layers/mlp_norm/scale"
         ]
         
@@ -484,8 +484,16 @@ class Pi0WeightInjector:
                 vision_layers = max(vision_layers, param.shape[0])
                 break
         
-        # Count available parameters
-        llm_available = sum(1 for suffix in llm_param_suffixes if self._find_param(suffix) is not None)
+        # Count available parameters (accounting for gating_einsum producing 2 parameters)
+        llm_available = 0
+        for suffix in llm_param_suffixes:
+            if self._find_param(suffix) is not None:
+                # gating_einsum produces 2 parameters (gate + up), others produce 1
+                if suffix == "llm/layers/mlp/gating_einsum":
+                    llm_available += 2
+                else:
+                    llm_available += 1
+        
         vision_available = sum(1 for suffix in vision_param_suffixes if self._find_param(suffix) is not None)
         
         llm_count = llm_available * llm_layers
