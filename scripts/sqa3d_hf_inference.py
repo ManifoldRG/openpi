@@ -17,7 +17,7 @@ import sys
 import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Dict, Any, List, Union
+from typing import Dict, Any, List, Union, Tuple
 import re
 import numpy as np
 import torch
@@ -231,45 +231,55 @@ class SQA3DInferenceHF:
             self.similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
             print("✓ Similarity model loaded successfully")
     
-    def prepare_inputs(self, questions: Union[str, List[str]], images: Union[Image.Image, List[Image.Image], None] = None) -> Dict[str, torch.Tensor]:
+    def prepare_inputs(self, questions: Union[str, List[str]], images: Union[Image.Image, List[Image.Image], None] = None) -> Tuple[Dict[str, torch.Tensor], List[int]]:
         """
-        Prepare inputs for the HuggingFace model.
+        Prepare inputs for the HuggingFace model, filtering out samples with missing images.
         
         Args:
             questions: SQA3D question text (single string or list of strings for batch)
             images: Images (single PIL Image or list of PIL Images, or None for text-only)
             
         Returns:
-            Processed inputs for the model
+            Tuple of (processed inputs for the model, list of valid indices)
         """
         # Handle both single question and batch of questions
         if isinstance(questions, str):
             questions = [questions]
         
-        # Handle images
+        # Handle images and filter out missing ones
+        valid_indices = []
+        valid_questions = []
+        valid_images = []
+        
         if images is None:
-            # Create dummy images for text-only questions
-            images = [Image.new('RGB', (224, 224), color='white') for _ in questions]
-            print(f"Created {len(images)} dummy images for text-only questions")
+            # For text-only questions, skip all samples (as per requirement)
+            print(f"Skipping {len(questions)} samples due to missing images")
+            return {}, []
         elif isinstance(images, Image.Image):
             images = [images]
-        elif isinstance(images, list):
-            # Ensure all elements are PIL Images, create dummy for None entries
-            processed_images = []
-            for img in images:
-                if img is None:
-                    processed_images.append(Image.new('RGB', (224, 224), color='white'))
-                    print(f"Created a dummy image for a None entry")
-                else:
-                    processed_images.append(img)
-            images = processed_images
+        elif not isinstance(images, list):
+            images = [images]
+        
+        # Filter out samples with missing images
+        for i, (question, img) in enumerate(zip(questions, images)):
+            if img is not None:
+                valid_indices.append(i)
+                valid_questions.append(question)
+                valid_images.append(img)
+            else:
+                print(f"Skipping sample {i} due to missing image")
+        
+        # If no valid samples remain, return empty
+        if not valid_questions:
+            print("No valid samples with images found, skipping batch")
+            return {}, []
         
         # Format the prompts with the system prompt and questions
-        prompts = [f"{SQA3DDefinitions.SYSTEM_PROMPT}\n\n{question}" for question in questions]
+        prompts = [f"{SQA3DDefinitions.SYSTEM_PROMPT}\n\n{question}" for question in valid_questions]
         
         # Process inputs for batch
         inputs = self.processor(
-            images=images,
+            images=valid_images,
             text=prompts,
             return_tensors="pt",
             padding=True  # Ensure proper padding for batch processing
@@ -278,7 +288,7 @@ class SQA3DInferenceHF:
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        return inputs
+        return inputs, valid_indices
     
     def generate_response(self, inputs: Dict[str, torch.Tensor]) -> Union[str, List[str]]:
         """
@@ -314,34 +324,38 @@ class SQA3DInferenceHF:
         else:
             return generated_texts
     
-    def process_batch(self, questions: List[str], images: List[Image.Image] = None) -> List[str]:
+    def process_batch(self, questions: List[str], images: List[Image.Image] = None) -> Tuple[List[str], List[int]]:
         """
-        Process a batch of questions using true batch inference.
+        Process a batch of questions using true batch inference, skipping samples with missing images.
         
         Args:
             questions: List of SQA3D questions
             images: List of images (optional, can contain None entries)
             
         Returns:
-            List of generated responses
+            Tuple of (list of generated responses, list of valid indices)
         """
         try:
-            # Prepare inputs for the entire batch
-            inputs = self.prepare_inputs(questions, images)
+            # Prepare inputs for the entire batch, filtering out missing images
+            inputs, valid_indices = self.prepare_inputs(questions, images)
             
-            # Generate responses for the entire batch
+            # If no valid samples, return empty results
+            if not valid_indices:
+                return [], []
+            
+            # Generate responses for the valid samples
             responses = self.generate_response(inputs)
             
             # Ensure we return a list even for single questions
             if isinstance(responses, str):
                 responses = [responses]
                 
-            return responses
+            return responses, valid_indices
             
         except Exception as e:
             print(f"Error processing batch: {e}")
             # Return empty responses for failed cases
-            return [""] * len(questions)
+            return [], []
     
     def evaluate_model(self, dataset_dir: str, batch_size: int = 8) -> Dict[str, Any]:
         """
@@ -395,26 +409,39 @@ class SQA3DInferenceHF:
             
             print(f"Processing batch {batch_idx + 1}/{len(dataloader)} with {len(questions)} samples...")
             
-            # Process batch
-            batch_outputs = self.process_batch(questions, scene_images)
+            # Process batch, getting responses and valid indices
+            batch_outputs, valid_indices = self.process_batch(questions, scene_images)
             
-            # Validate outputs and calculate metrics for this batch
-            exact_matches, similarity_scores, invalid_preds, normalized_preds = _validate_outputs_and_calculate_metrics(
-                self.similarity_model, 
-                batch_outputs, 
-                answers
-            )
+            # Filter answers to match valid indices (only evaluate samples that were processed)
+            if valid_indices:
+                valid_answers = [answers[i] for i in valid_indices]
+                
+                # Validate outputs and calculate metrics for this batch
+                exact_matches, similarity_scores, invalid_preds, normalized_preds = _validate_outputs_and_calculate_metrics(
+                    self.similarity_model, 
+                    batch_outputs, 
+                    valid_answers
+                )
+                
+                total_invalid_preds += invalid_preds
+                all_exact_matches.extend(exact_matches)
+                all_similarity_scores.extend(similarity_scores)
+                all_normalized_preds.extend(normalized_preds)
+                all_original_outputs.extend(batch_outputs)
+                all_labels.extend(valid_answers)
+                
+                processed_samples = len(valid_indices)
+            else:
+                # No valid samples in this batch
+                processed_samples = 0
             
-            total_invalid_preds += invalid_preds
-            all_exact_matches.extend(exact_matches)
-            all_similarity_scores.extend(similarity_scores)
-            all_normalized_preds.extend(normalized_preds)
-            all_original_outputs.extend(batch_outputs)
-            all_labels.extend(answers)
+            skipped_samples = len(questions) - processed_samples
+            if skipped_samples > 0:
+                print(f"Skipped {skipped_samples} samples due to missing images")
             
             # Update results
             dataset_results.total_batches = batch_idx + 1
-            dataset_results.total_samples += len(questions)
+            dataset_results.total_samples += processed_samples  # Only count actually processed samples
             
             # Progress update
             if (batch_idx + 1) % 10 == 0:
