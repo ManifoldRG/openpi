@@ -438,7 +438,6 @@ class RoboVQAInferenceHF:
         final_metrics = _calculate_final_metrics(all_exact_matches, all_similarity_scores, total_invalid_preds)
         
         # Update dataset results
-        dataset_results.all_exact_matches = final_metrics["exact_matches"]
         dataset_results.all_similarity_scores = final_metrics["similarity_scores"]
         dataset_results.exact_match_accuracy = final_metrics["exact_match_accuracy"]
         dataset_results.avg_similarity_score = final_metrics["avg_similarity_score"]
