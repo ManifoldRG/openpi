@@ -178,8 +178,6 @@ class PIQAInferenceHF:
         
         # Create tensor dummy images (since PIQA is text-only but PaliGemma expects images)
         dummy_images = [Image.new('RGB', (224, 224), color=(0, 0, 0)) for _ in questions]
-        dummy_images = [torch.tensor(np.array(img)).permute(2, 0, 1) for img in dummy_images]
-        dummy_images = torch.stack(dummy_images).to(self.device)
 
         # Format the prompts with the system prompt and questions
         prompts = [f"{PIQA_SYSTEM_PROMPT}\n\n{question}" for question in questions]
