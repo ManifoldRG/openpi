@@ -48,6 +48,8 @@ class Pi0WeightInjector:
         """
         self.pi0_weights = self._flatten_weights(pi0_weights)
         self.pi0_main = self._filter_main_weights(self.pi0_weights)
+        self.injected_params = {}  # Track injected parameter names and their param counts
+        self.non_injected_params = {}  # Track non-injected parameter names and their param counts
     
     def _flatten_weights(self, weights, prefix=""):
         """Flatten nested weight dictionary with '/' separated keys."""
@@ -74,6 +76,13 @@ class Pi0WeightInjector:
                 filtered[k] = v
         return filtered
     
+    def _count_total_model_params(self, hf_model):
+        """Count total parameters in the HuggingFace model."""
+        total_params = 0
+        for param in hf_model.parameters():
+            total_params += param.numel()
+        return total_params
+    
     def inject_weights(self, hf_model):
         """
         Inject Pi0 weights into HuggingFace model.
@@ -86,6 +95,10 @@ class Pi0WeightInjector:
         """
         print("Starting Pi0 weight injection...")
         hf_state = hf_model.state_dict()
+        
+        # Initialize tracking dictionaries
+        self.injected_params = {}
+        self.non_injected_params = {}
         
         loaded_count = 0
         total_count = 0
@@ -119,7 +132,7 @@ class Pi0WeightInjector:
         
         # Count parameters more accurately by checking actual availability
         total_count += self._count_available_layer_params()
-        
+
         success_rate = loaded_count / max(total_count, 1)
         print(f"Loaded {loaded_count}/{total_count} parameters ({success_rate:.1%})")
         
@@ -133,6 +146,9 @@ class Pi0WeightInjector:
     def _load_single_param(self, pi0_key, hf_key, hf_state):
         """Load a single parameter with shape handling."""
         if pi0_key not in self.pi0_main or hf_key not in hf_state:
+            if hf_key in hf_state:
+                param_count = hf_state[hf_key].numel()
+                #self.non_injected_params[hf_key] = param_count
             return False
         
         pi0_param = self.pi0_main[pi0_key].copy()
@@ -143,14 +159,20 @@ class Pi0WeightInjector:
         
         if pi0_param.shape != hf_param.shape:
             print(f"Warning: Shape mismatch {hf_key}: {pi0_param.shape} vs {hf_param.shape}")
+            param_count = hf_param.numel()
+            #self.non_injected_params[hf_key] = param_count
             return False
         
         try:
             with torch.no_grad():
                 hf_param.copy_(torch.from_numpy(pi0_param))
+            param_count = hf_param.numel()
+            self.injected_params[hf_key] = param_count
             return True
         except Exception as e:
             print(f"Error loading {hf_key}: {e}")
+            param_count = hf_param.numel()
+            #self.non_injected_params[hf_key] = param_count
             return False
     
     def _handle_shape_mismatch(self, pi0_param, hf_param, param_name):
@@ -340,6 +362,7 @@ class Pi0WeightInjector:
         if params['mlp_norm'] is not None:
             mlp_norm_weight = params['mlp_norm'][layer_idx]
             if self._copy_param(f"{prefix}.post_attention_layernorm.weight", mlp_norm_weight, hf_state):
+                self.injected_params
                 loaded += 1
         
         return loaded
@@ -455,14 +478,20 @@ class Pi0WeightInjector:
         pi0_array = self._handle_shape_mismatch(pi0_array, hf_param, hf_key)
         
         if pi0_array.shape != hf_param.shape:
+            param_count = hf_param.numel()
+            self.non_injected_params[hf_key] = param_count
             return False
         
         try:
             with torch.no_grad():
                 hf_param.copy_(torch.from_numpy(pi0_array))
+            param_count = hf_param.numel()
+            self.injected_params[hf_key] = param_count
             return True
         except Exception as e:
             print(f"Error copying parameter {hf_key}: {e}")
+            param_count = hf_param.numel()
+            self.non_injected_params[hf_key] = param_count
             return False
     
     def _count_available_layer_params(self):
@@ -529,6 +558,80 @@ class Pi0WeightInjector:
         vision_count = vision_available * vision_layers
         
         return llm_count + vision_count
+    
+    def _print_parameter_summary(self, hf_model):
+        """Print summary of injected and non-injected parameters."""
+        hf_state = hf_model.state_dict()
+        # iterate through hf_state keys and add those not in injected_params into non_injected_params
+        for key in hf_state.keys():
+            if key not in self.injected_params:
+                # check type of hf_state[key], if it's numpy.ndarray, then use .size
+                if isinstance(hf_state[key], np.ndarray):
+                    self.non_injected_params[key] = hf_state[key].size
+                else:
+                    self.non_injected_params[key] = hf_state[key].numel()
+        total_model_params = self._count_total_model_params(hf_model)
+        injected_total = sum(self.injected_params.values())
+        non_injected_total = sum(self.non_injected_params.values())
+        injection_coverage = (injected_total / total_model_params * 100) if total_model_params > 0 else 0
+        
+        # Verify that injected + non-injected adds up to total
+        accounted_total = injected_total + non_injected_total
+        param_accounting_correct = (accounted_total == total_model_params)
+        
+        print("\nParameter Injection Summary:")
+        print(f"  Total model parameters: {total_model_params:,}")
+        print(f"  Injected parameters: {len(self.injected_params)} tensors, {injected_total:,} total parameters")
+        print(f"  Non-injected parameters: {len(self.non_injected_params)} tensors, {non_injected_total:,} total parameters")
+        print(f"  Accounted parameters: {accounted_total:,} total parameters")
+        print(f"  Parameter accounting: {'✓ Correct' if param_accounting_correct else '✗ Mismatch'}")
+        if not param_accounting_correct:
+            difference = total_model_params - accounted_total
+            print(f"    Difference: {difference:+,} parameters")
+        print(f"  Injection coverage: {injection_coverage:.1f}% of total model parameters")
+        
+        if self.non_injected_params:
+            print("\nnon-injected parameters by size:")
+            sorted_non_injected = sorted(self.non_injected_params.items(), key=lambda x: x[1], reverse=True)
+            for param_name, param_count in sorted_non_injected:
+                print(f"    {param_name}: {param_count:,} parameters")
+    
+    def get_injection_stats(self, total_model_params=None):
+        """
+        Get parameter injection statistics.
+        
+        Args:
+            total_model_params (int, optional): Total parameters in the model
+            
+        Returns:
+            dict: Dictionary containing injection statistics with keys:
+                - injected_params: dict of injected parameter names and their counts
+                - non_injected_params: dict of non-injected parameter names and their counts
+                - total_injected: total number of injected parameters
+                - total_non_injected: total number of non-injected parameters
+                - injection_rate: percentage of parameters successfully injected
+                - total_model_params: total parameters in the model (if provided)
+                - injection_coverage: percentage of total model parameters injected (if total_model_params provided)
+        """
+        total_injected = sum(self.injected_params.values())
+        total_non_injected = sum(self.non_injected_params.values())
+        total_params = total_injected + total_non_injected
+        injection_rate = total_injected / max(total_params, 1) * 100
+        
+        stats = {
+            'injected_params': self.injected_params.copy(),
+            'non_injected_params': self.non_injected_params.copy(),
+            'total_injected': total_injected,
+            'total_non_injected': total_non_injected,
+            'injection_rate': injection_rate
+        }
+        
+        if total_model_params is not None:
+            injection_coverage = (total_injected / total_model_params * 100) if total_model_params > 0 else 0
+            stats['total_model_params'] = total_model_params
+            stats['injection_coverage'] = injection_coverage
+        
+        return stats
 
 
 def load_pi0_weights():
@@ -593,6 +696,7 @@ def get_pi0_injected_model(model_id="google/paligemma-3b-pt-224", device=None):
             raise RuntimeError("Pi0 weight injection failed")
         
         print("✓ Pi0 weight-injected model ready for inference")
+        injector._print_parameter_summary(model)
         return model, processor
         
     except Exception as e:
