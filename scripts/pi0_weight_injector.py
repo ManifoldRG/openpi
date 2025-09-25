@@ -61,9 +61,18 @@ class Pi0WeightInjector:
         return flat
     
     def _filter_main_weights(self, flat_weights):
-        """Filter out action expert weights (those with '_1' suffix)."""
-        return {k: v for k, v in flat_weights.items() 
-                if not any(part.endswith("_1") for part in k.split("/"))}
+        """Filter out action expert weights (those with '_1' suffix in LLM layers only)."""
+        filtered = {}
+        for k, v in flat_weights.items():
+            # Only filter _1 suffixes in LLM layer paths, not vision encoder paths
+            if k.startswith("llm/"):
+                # For LLM layers, filter out action expert weights (_1 suffix)
+                if not any(part.endswith("_1") for part in k.split("/")):
+                    filtered[k] = v
+            else:
+                # For non-LLM paths (img/, etc.), keep all weights including _1 suffixes
+                filtered[k] = v
+        return filtered
     
     def inject_weights(self, hf_model):
         """
@@ -190,16 +199,15 @@ class Pi0WeightInjector:
         """Load LLM transformer layer weights."""
         loaded = 0
         
-        # Find batched LLM parameters
+        # Find batched LLM parameters (using correct Pi0 parameter names)
         layer_params = {
             'q': self._find_param("llm/layers/attn/q_einsum/w"),
-            'k': self._find_param("llm/layers/attn/k_einsum/w"),
-            'v': self._find_param("llm/layers/attn/v_einsum/w"),
+            'kv': self._find_param("llm/layers/attn/kv_einsum/w"),  # Combined K and V
             'o': self._find_param("llm/layers/attn/attn_vec_einsum/w"),
             'gating': self._find_param("llm/layers/mlp/gating_einsum"),
             'down': self._find_param("llm/layers/mlp/linear"),
-            'attn_norm': self._find_param("llm/layers/attn_norm/scale"),
-            'mlp_norm': self._find_param("llm/layers/mlp_norm/scale"),
+            'attn_norm': self._find_param("llm/layers/pre_attention_norm/scale"),
+            'mlp_norm': self._find_param("llm/layers/pre_ffw_norm/scale"),
         }
         
         if not any(param is not None for param in layer_params.values()):
@@ -283,15 +291,19 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.self_attn.q_proj.weight", q_reshaped, hf_state):
                 loaded += 1
         
-        if params['k'] is not None:
-            k_weight = params['k'][layer_idx]
-            k_reshaped = np.transpose(k_weight, (0, 2, 1)).reshape(-1, k_weight.shape[1])
+        # Handle combined KV parameters (shape: (18, 2, 1, 2048, 256))
+        if params['kv'] is not None:
+            kv_weight = params['kv'][layer_idx]  # Shape: (2, 1, 2048, 256)
+            # Extract K and V weights
+            k_weight = kv_weight[0, 0]  # Shape: (2048, 256) 
+            v_weight = kv_weight[1, 0]  # Shape: (2048, 256)
+            
+            # Transpose to match HF format: (256, 2048)
+            k_reshaped = k_weight.T
+            v_reshaped = v_weight.T
+            
             if self._copy_param(f"{prefix}.self_attn.k_proj.weight", k_reshaped, hf_state):
                 loaded += 1
-        
-        if params['v'] is not None:
-            v_weight = params['v'][layer_idx]
-            v_reshaped = np.transpose(v_weight, (0, 2, 1)).reshape(-1, v_weight.shape[1])
             if self._copy_param(f"{prefix}.self_attn.v_proj.weight", v_reshaped, hf_state):
                 loaded += 1
         
@@ -443,12 +455,12 @@ class Pi0WeightInjector:
     
     def _count_available_layer_params(self):
         """Count available layer parameters in Pi0 weights dynamically."""
-        # LLM layer parameter templates
+        # LLM layer parameter templates (using correct Pi0 names)
         llm_param_suffixes = [
-            "llm/layers/attn/q_einsum/w", "llm/layers/attn/k_einsum/w", 
-            "llm/layers/attn/v_einsum/w", "llm/layers/attn/attn_vec_einsum/w",
+            "llm/layers/attn/q_einsum/w", "llm/layers/attn/kv_einsum/w", 
+            "llm/layers/attn/attn_vec_einsum/w",
             "llm/layers/mlp/gating_einsum", "llm/layers/mlp/linear",
-            "llm/layers/attn_norm/scale", "llm/layers/mlp_norm/scale"
+            "llm/layers/pre_attention_norm/scale", "llm/layers/pre_ffw_norm/scale"
         ]
         
         # Vision layer parameter templates
@@ -484,12 +496,15 @@ class Pi0WeightInjector:
                 vision_layers = max(vision_layers, param.shape[0])
                 break
         
-        # Count available parameters (accounting for gating_einsum producing 2 parameters)
+        # Count available parameters (accounting for special cases)
         llm_available = 0
         for suffix in llm_param_suffixes:
             if self._find_param(suffix) is not None:
-                # gating_einsum produces 2 parameters (gate + up), others produce 1
+                # gating_einsum produces 2 parameters (gate + up)
+                # kv_einsum produces 2 parameters (key + value)
                 if suffix == "llm/layers/mlp/gating_einsum":
+                    llm_available += 2
+                elif suffix == "llm/layers/attn/kv_einsum/w":
                     llm_available += 2
                 else:
                     llm_available += 1
