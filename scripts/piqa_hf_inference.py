@@ -191,13 +191,14 @@ class PIQAInferenceHF:
         )
 
         # Zero out attention on image token *keys*
-        img_id = self.model.config.image_token_index  # e.g., 256000
-        am = inputs["attention_mask"].clone()      # (B, T)
-        print("attention mask values and counts before zeroing out img tokens:\n", torch.unique(am, return_counts=True ))
-        img_pos = (inputs["input_ids"] == img_id)  # (B, T) True where <img> placeholders are
-        am[img_pos] = 0
-        inputs["attention_mask"] = am
-        print("attention mask values and counts after zeroing out img tokens:\n", torch.unique(inputs["attention_mask"], return_counts=True ))
+        if self.args.mask_image_tokens:
+            img_id = self.model.config.image_token_index  # e.g., 256000
+            am = inputs["attention_mask"].clone()      # (B, T)
+            print("attention mask values and counts before zeroing out img tokens:\n", torch.unique(am, return_counts=True ))
+            img_pos = (inputs["input_ids"] == img_id)  # (B, T) True where <img> placeholders are
+            am[img_pos] = 0
+            inputs["attention_mask"] = am
+            print("attention mask values and counts after zeroing out img tokens:\n", torch.unique(inputs["attention_mask"], return_counts=True ))
 
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
