@@ -353,7 +353,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument(
         '--mask_image_tokens',
-        action='store_true',
+        type=bool,
         default=False,
         help='Whether to mask dummy image tokens in the input'
     )
