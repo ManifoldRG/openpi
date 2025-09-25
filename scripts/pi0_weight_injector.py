@@ -106,12 +106,6 @@ class Pi0WeightInjector:
             ("img/Transformer/encoder_norm/bias", "vision_tower.vision_model.post_layernorm.bias"),
         ]
         
-        # Handle weight tying: Pi0 JAX model ties embeddings and lm_head weights
-        # Copy embed_tokens to lm_head to replicate this behavior
-        if ("llm/embedder/input_embedding" in self.pi0_main and 
-            "language_model.lm_head.weight" in hf_state):
-            mappings.append(("llm/embedder/input_embedding", "language_model.lm_head.weight"))
-        
         # Load direct mappings
         for pi0_key, hf_key in mappings:
             if self._load_single_param(pi0_key, hf_key, hf_state):
