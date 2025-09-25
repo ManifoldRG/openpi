@@ -311,7 +311,7 @@ class PIQAInferenceHF:
             if (batch_idx + 1) % 10 == 0:
                 print(f"Processed {batch_idx + 1} batches...")
             
-            if dataset_results.total_samples >= self.args.max_samples:
+            if self.args.max_samples is not None and dataset_results.total_samples >= self.args.max_samples:
                 print(f"Reached maximum sample limit of {self.args.max_samples}. Stopping evaluation.")
                 break
             
