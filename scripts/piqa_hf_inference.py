@@ -40,7 +40,7 @@ from src.data_utils.piqa_dataloader import get_piqa_test_dataloader
 from src.v1.modules.openpi.scripts.pi0_weight_injector import get_pi0_injected_model
 
 # PIQA system prompt (same as used in piqa_module.py)
-PIQA_SYSTEM_PROMPT = """You are evaluating physical commonsense reasoning questions. You will be presented with a goal and possible solutions.
+PIQA_SYSTEM_PROMPT = """<image>You are evaluating physical commonsense reasoning questions. You will be presented with a goal and possible solutions.
     Your task is to determine which solution is more appropriate for achieving the given goal.
     Output only the index of the correct solution, and nothing else.
     Do not provide any explanation, reasoning, or additional text."""
@@ -133,7 +133,7 @@ def _calculate_final_metrics(preds: List[int], trues: List[int]) -> Dict[str, An
 class PIQAInferenceHF:
     """PIQA inference class using HuggingFace PaliGemma with Pi0 weight injection"""
     
-    def __init__(self, model_id: str = "google/paligemma-3b-pt-224", device: str = None):
+    def __init__(self, model_id: str = "google/paligemma-3b-pt-224", device: str = None, args: argparse.Namespace = None):
         """
         Initialize the PIQA inference class.
         
@@ -145,7 +145,8 @@ class PIQAInferenceHF:
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model = None
         self.processor = None
-        
+        self.args = args
+
         print(f"Initializing PIQA inference with device: {self.device}")
     
     def load_model(self):
@@ -175,9 +176,9 @@ class PIQAInferenceHF:
         if isinstance(questions, str):
             questions = [questions]
         
-        # Create dummy images (since PIQA is text-only but PaliGemma expects images)
-        dummy_images = [Image.new('RGB', (224, 224), color='white') for _ in questions]
-        
+        # Create tensor dummy images (since PIQA is text-only but PaliGemma expects images)
+        dummy_images = [Image.new('RGB', (224, 224), color=(0, 0, 0)) for _ in questions]
+
         # Format the prompts with the system prompt and questions
         prompts = [f"{PIQA_SYSTEM_PROMPT}\n\n{question}" for question in questions]
         
@@ -188,7 +189,16 @@ class PIQAInferenceHF:
             return_tensors="pt",
             padding=True  # Ensure proper padding for batch processing
         )
-        
+
+        # Zero out attention on image token *keys*
+        img_id = self.model.config.image_token_index  # e.g., 256000
+        am = inputs["attention_mask"].clone()      # (B, T)
+        print("attention mask values and counts before zeroing out img tokens:\n", torch.unique(am, return_counts=True ))
+        img_pos = (inputs["input_ids"] == img_id)  # (B, T) True where <img> placeholders are
+        am[img_pos] = 0
+        inputs["attention_mask"] = am
+        print("attention mask values and counts after zeroing out img tokens:\n", torch.unique(inputs["attention_mask"], return_counts=True ))
+
         # Move to device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
@@ -300,6 +310,10 @@ class PIQAInferenceHF:
             if (batch_idx + 1) % 10 == 0:
                 print(f"Processed {batch_idx + 1} batches...")
             
+            if dataset_results.total_samples >= self.args.max_samples:
+                print(f"Reached maximum sample limit of {self.args.max_samples}. Stopping evaluation.")
+                break
+            
             # Memory cleanup
             gc.collect()
             if torch.cuda.is_available():
@@ -336,7 +350,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run PIQA inference with Pi0 weight-injected HuggingFace PaliGemma"
     )
-    
+
+    parser.add_argument(
+        '--mask_image_tokens',
+        action='store_true',
+        default=True,
+        help='Whether to mask dummy image tokens in the input'
+    )
+
     parser.add_argument(
         '--dataset_dir',
         type=str,
@@ -402,7 +423,8 @@ def main():
         # Initialize inference class
         piqa_inference = PIQAInferenceHF(
             model_id=args.model_id,
-            device=args.device
+            device=args.device,
+            args=args
         )
         
         # Load the Pi0 weight-injected model
@@ -420,7 +442,7 @@ def main():
         # Limit samples if specified
         if args.max_samples is not None:
             print(f"Limiting evaluation to {args.max_samples} samples")
-            # Note: This would require modifying the dataloader, but for now we'll process all
+    
         
         # Run evaluation
         results = piqa_inference.evaluate_model(dataloader)
