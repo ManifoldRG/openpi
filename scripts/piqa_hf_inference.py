@@ -40,7 +40,7 @@ from src.data_utils.piqa_dataloader import get_piqa_test_dataloader
 from src.v1.modules.openpi.scripts.pi0_weight_injector import get_pi0_injected_model
 
 # PIQA system prompt (same as used in piqa_module.py)
-PIQA_SYSTEM_PROMPT = """<image>You are evaluating physical commonsense reasoning questions. You will be presented with a goal and possible solutions.
+PIQA_SYSTEM_PROMPT = """You are evaluating physical commonsense reasoning questions. You will be presented with a goal and possible solutions.
     Your task is to determine which solution is more appropriate for achieving the given goal.
     Output only the index of the correct solution, and nothing else.
     Do not provide any explanation, reasoning, or additional text."""
@@ -354,7 +354,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         '--mask_image_tokens',
         action='store_true',
-        default=True,
+        default=False,
         help='Whether to mask dummy image tokens in the input'
     )
 

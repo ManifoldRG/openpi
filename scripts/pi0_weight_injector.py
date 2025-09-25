@@ -96,10 +96,6 @@ class Pi0WeightInjector:
         print("Starting Pi0 weight injection...")
         hf_state = hf_model.state_dict()
         
-        # Initialize tracking dictionaries
-        self.injected_params = {}
-        self.non_injected_params = {}
-        
         loaded_count = 0
         total_count = 0
         
@@ -362,7 +358,6 @@ class Pi0WeightInjector:
         if params['mlp_norm'] is not None:
             mlp_norm_weight = params['mlp_norm'][layer_idx]
             if self._copy_param(f"{prefix}.post_attention_layernorm.weight", mlp_norm_weight, hf_state):
-                self.injected_params
                 loaded += 1
         
         return loaded
