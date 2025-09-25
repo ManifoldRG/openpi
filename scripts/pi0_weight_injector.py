@@ -241,6 +241,7 @@ class Pi0WeightInjector:
             'fc1': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_0/kernel"),
             'fc2': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_1/kernel"),
             'fc1_bias': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_0/bias"),
+            'fc2_bias': self._find_param("img/Transformer/encoderblock/MlpBlock_0/Dense_1/bias"),
             'ln1': self._find_param("img/Transformer/encoderblock/LayerNorm_0/scale"),
             'ln2': self._find_param("img/Transformer/encoderblock/LayerNorm_1/scale"),
             'ln1_bias': self._find_param("img/Transformer/encoderblock/LayerNorm_0/bias"),
@@ -413,6 +414,11 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.mlp.fc1.bias", fc1_bias, hf_state):
                 loaded += 1
         
+        if params['fc2_bias'] is not None:
+            fc2_bias = params['fc2_bias'][layer_idx]
+            if self._copy_param(f"{prefix}.mlp.fc2.bias", fc2_bias, hf_state):
+                loaded += 1
+        
         # Layer norms
         if params['ln1'] is not None:
             ln1_weight = params['ln1'][layer_idx]
@@ -476,6 +482,7 @@ class Pi0WeightInjector:
             "img/Transformer/encoderblock/MlpBlock_0/Dense_0/kernel",
             "img/Transformer/encoderblock/MlpBlock_0/Dense_1/kernel",
             "img/Transformer/encoderblock/MlpBlock_0/Dense_0/bias",
+            "img/Transformer/encoderblock/MlpBlock_0/Dense_1/bias",
             "img/Transformer/encoderblock/LayerNorm_0/scale",
             "img/Transformer/encoderblock/LayerNorm_1/scale",
             "img/Transformer/encoderblock/LayerNorm_0/bias"
@@ -500,7 +507,7 @@ class Pi0WeightInjector:
         llm_available = 0
         for suffix in llm_param_suffixes:
             if self._find_param(suffix) is not None:
-                # gating_einsum produces 2 parameters (gate + up)
+                # gating_einsum produces 2 parameters (gate + up)   
                 # kv_einsum produces 2 parameters (key + value)
                 if suffix == "llm/layers/mlp/gating_einsum":
                     llm_available += 2
