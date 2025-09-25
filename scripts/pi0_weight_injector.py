@@ -245,6 +245,7 @@ class Pi0WeightInjector:
             'ln1': self._find_param("img/Transformer/encoderblock/LayerNorm_0/scale"),
             'ln2': self._find_param("img/Transformer/encoderblock/LayerNorm_1/scale"),
             'ln1_bias': self._find_param("img/Transformer/encoderblock/LayerNorm_0/bias"),
+            'ln2_bias': self._find_param("img/Transformer/encoderblock/LayerNorm_1/bias"),
         }
         
         if not any(param is not None for param in vision_params.values()):
@@ -436,6 +437,11 @@ class Pi0WeightInjector:
             if self._copy_param(f"{prefix}.layer_norm1.bias", ln1_bias, hf_state):
                 loaded += 1
         
+        if params['ln2_bias'] is not None:
+            ln2_bias = params['ln2_bias'][layer_idx]
+            if self._copy_param(f"{prefix}.layer_norm2.bias", ln2_bias, hf_state):
+                loaded += 1
+        
         return loaded
     
     def _copy_param(self, hf_key, pi0_array, hf_state):
@@ -485,7 +491,8 @@ class Pi0WeightInjector:
             "img/Transformer/encoderblock/MlpBlock_0/Dense_1/bias",
             "img/Transformer/encoderblock/LayerNorm_0/scale",
             "img/Transformer/encoderblock/LayerNorm_1/scale",
-            "img/Transformer/encoderblock/LayerNorm_0/bias"
+            "img/Transformer/encoderblock/LayerNorm_0/bias",
+            "img/Transformer/encoderblock/LayerNorm_1/bias",
         ]
         
         # Get actual layer counts from the parameter shapes
