@@ -75,8 +75,8 @@ class DatasetResults:
     similarity_std: float = 0
     high_similarity_percentage: float = 0
     high_similarity_threshold: float = 0.8
-    invalid_turn_rate: float = 0
-    invalid_conversation_rate: float = 0
+    invalid_turn_percentage: float = 0
+    invalid_conversation_percentage: float = 0
     total_predicted_functions: int = 0
     total_ground_truth_functions: int = 0
     avg_valid_predicted_functions_per_sample: float = 0
@@ -252,9 +252,9 @@ def _calculate_final_metrics(
 
     total_ground_truth_turns = sum(len(gt_turns) for gt_turns in ground_truth_calls)
     result['total_invalid_turns'] = total_invalid_turns
-    result['invalid_turn_rate'] = (total_invalid_turns / total_ground_truth_turns * 100) if total_ground_truth_turns > 0 else 0.0
+    result['invalid_turn_percentage'] = (total_invalid_turns / total_ground_truth_turns * 100) if total_ground_truth_turns > 0 else 0.0
     result['total_invalid_conversations'] = total_invalid_conversations
-    result['invalid_conversation_rate'] = (total_invalid_conversations / total_samples * 100) if total_samples > 0 else 0.0
+    result['invalid_conversation_percentage'] = (total_invalid_conversations / total_samples * 100) if total_samples > 0 else 0.0
     result['exact_match_accuracy'] = exact_match_accuracy
     result['turn_level_accuracy_until_failure'] = turn_accuracies_until_failure
     result['avg_similarity_score'] = avg_similarity_score
@@ -536,9 +536,9 @@ class BFCLInferenceHF:
 
         # Update dataset results
         dataset_results.total_invalid_turns = final_metrics["total_invalid_turns"]
-        dataset_results.invalid_turn_rate = final_metrics["invalid_turn_rate"]
+        dataset_results.invalid_turn_percentage = final_metrics["invalid_turn_percentage"]
         dataset_results.total_invalid_conversations = final_metrics["total_invalid_conversations"]
-        dataset_results.invalid_conversation_rate = final_metrics["invalid_conversation_rate"]
+        dataset_results.invalid_conversation_percentage = final_metrics["invalid_conversation_percentage"]
         dataset_results.turn_level_accuracy = final_metrics["turn_level_accuracy"]
         dataset_results.avg_turn_of_first_failure = final_metrics["avg_turn_of_first_failure"]
         dataset_results.turn_level_accuracy_until_failure = final_metrics["turn_level_accuracy_until_failure"]
@@ -569,7 +569,7 @@ class BFCLInferenceHF:
         print(f"Min Similarity Score: {dataset_results.min_similarity_score:.4f}")
         print(f"Similarity Std Dev: {dataset_results.similarity_std:.4f}")
         print(f"High Similarity (≥{dataset_results.high_similarity_threshold}): {dataset_results.high_similarity_percentage:.2f}%")
-        print(f"Invalid turns: {dataset_results.total_invalid_turns} ({dataset_results.invalid_turn_rate:.2f}%)")
+        print(f"Invalid turns: {dataset_results.total_invalid_turns} ({dataset_results.invalid_turn_percentage:.2f}%)")
         print(f"Average predicted functions per sample: {dataset_results.avg_valid_predicted_functions_per_sample:.2f}")
         print(f"Average ground truth functions per sample: {dataset_results.avg_ground_truth_functions_per_sample:.2f}")
         print(f"Evaluation time: {dataset_results.eval_time:.2f} seconds")
@@ -703,8 +703,8 @@ def main():
     print(f"Min Similarity Score: {results.get('min_similarity_score', 0):.4f}")
     print(f"Similarity Std Dev: {results.get('similarity_std', 0):.4f}")
     print(f"High Similarity (≥{results.get('high_similarity_threshold', 0.8)}): {results.get('high_similarity_percentage', 0):.2f}%")
-    print(f"Invalid turns: {results.get('total_invalid_turns', 0)} ({results.get('invalid_turn_rate', 0):.2f}%)")
-    print(f"Invalid conversations: {results.get('total_invalid_conversations', 0)} ({results.get('invalid_conversation_rate', 0):.2f}%)")
+    print(f"Invalid turns: {results.get('total_invalid_turns', 0)} ({results.get('invalid_turn_percentage', 0):.2f}%)")
+    print(f"Invalid conversations: {results.get('total_invalid_conversations', 0)} ({results.get('invalid_conversation_percentage', 0):.2f}%)")
     print(f"Average predicted functions per sample: {results.get('avg_predicted_functions_per_sample', 0):.2f}")
     print(f"Average ground truth functions per sample: {results.get('avg_ground_truth_functions_per_sample', 0):.2f}")
     print(f"Evaluation time: {results.get('eval_time', 0):.2f} seconds")
